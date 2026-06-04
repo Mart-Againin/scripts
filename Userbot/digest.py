@@ -220,28 +220,71 @@ def _get_theses_count(zone: str) -> int:
 
 
 def _clean_text(text: str) -> str:
-    """Убирает URL и лишние пробелы перед подачей в суммаризатор."""
-    text = re.sub(r'https?://\S+', '', text)
-    text = re.sub(r'\s{2,}', ' ', text)
+    """
+    Очищает текст перед суммаризацией и извлечением аннотации:
+    - убирает хэштеги (#раскладка, #новости и т.п.)
+    - убирает URL
+    - убирает лишние пробелы
+    """
+    text = re.sub(r'#\S+', '', text)       # хэштеги
+    text = re.sub(r'https?://\S+', '', text)  # URL
+    text = re.sub(r'\s{2,}', ' ', text)    # двойные пробелы
     return text.strip()
+
+
+# Максимальная длина сообщения в Telegram
+TG_MAX_LEN = 4096
+
+# Максимальная длина аннотации (символов)
+ANNOTATION_MAX_LEN = 250
 
 
 def _extract_annotation(text: str) -> str:
     """
-    Аннотация = первый непустой абзац.
-    Если он слишком длинный (> 400 симв.) — первое предложение.
+    Аннотация — смысловой лид поста: 1–3 предложения суммарно не длиннее
+    ANNOTATION_MAX_LEN символов.
+
+    Алгоритм:
+    - Разбиваем текст на предложения (работает и без абзацев).
+    - Добавляем предложения одно за другим пока:
+        * суммарная длина не превысила ANNOTATION_MAX_LEN, И
+        * не набрали 3 предложения.
+    - Если первое предложение само по себе длиннее лимита — берём его целиком
+      (не обрезаем, чтобы не терять смысл).
+    - Минимум 1 предложение всегда.
     """
-    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
-    if not paragraphs:
-        return text[:300]
+    if not text or not text.strip():
+        return ""
 
-    first = paragraphs[0]
-    if len(first) <= 400:
-        return first
+    # Чистим хэштеги и URL перед извлечением аннотации
+    text = _clean_text(text)
+    normalized = re.sub(r'\n+', ' ', text).strip()
+    sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', normalized) if len(s.strip()) > 10]
 
-    # Первый абзац длинный — берём первое предложение
-    sentences = re.split(r'(?<=[.!?])\s+', first)
-    return sentences[0] if sentences else first[:300]
+    if not sentences:
+        return normalized[:ANNOTATION_MAX_LEN]
+
+    collected = []
+    total_len = 0
+
+    for sent in sentences[:3]:
+        if not collected:
+            # Первое предложение берём всегда
+            collected.append(sent)
+            total_len += len(sent)
+            continue
+
+        # Второе предложение берём принудительно если первое < 80 симв.
+        # (короткое первое — скорее всего заголовок, нужен контекст)
+        force_second = len(collected) == 1 and total_len < 80
+
+        if force_second or total_len + 1 + len(sent) <= ANNOTATION_MAX_LEN:
+            collected.append(sent)
+            total_len += 1 + len(sent)
+        else:
+            break
+
+    return " ".join(collected)
 
 
 def _summarize(text: str, n: int) -> list[str]:
@@ -298,8 +341,8 @@ def process_post(text: str, url: str) -> str:
         # Тезисы
         if theses:
             lines.append("Тезисы:")
-            for i, t in enumerate(theses, 1):
-                lines.append(f"{i}. {t}")
+            for t in theses:
+                lines.append(f"• {t}")
         else:
             # Fallback: если суммаризация не дала результата — первые 500 симв.
             logger.warning(f"digest: суммаризация вернула пустой список для поста {url}")
@@ -308,7 +351,17 @@ def process_post(text: str, url: str) -> str:
         lines.append("")
         lines.append(f"🔗 {url}")
 
-        return "\n".join(lines)
+        result = "\n".join(lines)
+
+        # Telegram не пропускает сообщения длиннее 4096 символов.
+        # Если вышли за лимит — обрезаем тезисы, ссылку сохраняем всегда.
+        if len(result) > TG_MAX_LEN:
+            footer = f"\n\n🔗 {url}"
+            cutoff = TG_MAX_LEN - len(footer) - 4  # 4 = "…\n\n"
+            result = result[:cutoff].rsplit("\n", 1)[0] + "\n…" + footer
+            logger.warning(f"digest: сообщение обрезано до {TG_MAX_LEN} символов ({url})")
+
+        return result
 
     except Exception as e:
         logger.error(f"digest: критическая ошибка в process_post: {e}", exc_info=True)
