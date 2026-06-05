@@ -1,0 +1,13 @@
+# tg-channel-monitor — зафиксированные зависимости
+# Окружение: Python 3.11 + NumPy < 2.0 (совместимо с QEMU Virtual CPU)
+
+telethon==1.36.0
+python-dotenv==1.0.1
+
+# Суммаризация (digest режим)
+sumy==0.9.0
+nltk==3.8.1
+
+# NumPy: строго < 2.0 — версии 2.x требуют X86_V2 инструкций
+# которых нет на QEMU Virtual CPU 2.5+
+numpy==1.26.4
