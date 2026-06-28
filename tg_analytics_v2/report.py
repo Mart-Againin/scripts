@@ -47,9 +47,13 @@ API_ID        = int(os.getenv("API_ID", "0"))
 API_HASH      = os.getenv("API_HASH", "")
 SESSION_NAME  = os.getenv("SESSION_NAME", "tg_analytics")
 CHANNELS_RAW  = os.getenv("CHANNELS", "")
-RECIPIENT_ID  = int(os.getenv("REPORT_RECIPIENT_ID", "0"))
+def _parse_ids(key):
+    raw = os.getenv(key, "")
+    return [int(x.strip()) for x in raw.split(",") if x.strip().lstrip("-").isdigit()]
+
+RECIPIENT_IDS = _parse_ids("REPORT_RECIPIENT_ID")
 DEBUG_MODE    = os.getenv("DEBUG", "false").lower() == "true"
-DEBUG_RID     = int(os.getenv("DEBUG_RECIPIENT_ID", "0"))
+DEBUG_IDS     = _parse_ids("DEBUG_RECIPIENT_ID")
 OUTPUT_DIR    = Path(os.getenv("OUTPUT_DIR", "output"))
 REGISTRY_DIR  = Path(os.getenv("REGISTRY_DIR", "registry"))
 ARCHIVE_DIR   = Path(os.getenv("ARCHIVE_DIR", "archive"))
@@ -697,12 +701,20 @@ def archive_monthly(channel_username: str, ym: str):
     log.info(f"Реестр {ch} очищен за {ym}, осталось {len(remaining)} постов")
 
 
-async def build_and_send(report_type: str, debug_override: bool = False):
+async def build_and_send(report_type: str, debug_override: bool = False, month_override: str = None):
     is_debug = DEBUG_MODE or debug_override
-    recipient = DEBUG_RID if is_debug else RECIPIENT_ID
+    recipients = DEBUG_IDS if is_debug else RECIPIENT_IDS
     channels = [c.strip() for c in CHANNELS_RAW.split(",") if c.strip()]
 
-    date_from, date_to, period_label = determine_period(report_type)
+    if month_override and report_type == "monthly":
+        year, mo = int(month_override[:4]), int(month_override[5:7])
+        from calendar import monthrange
+        d_from = date(year, mo, 1)
+        d_to   = date(year, mo, monthrange(year, mo)[1])
+        period_label = f"{MONTHS_RU.get(mo, str(mo))} {year}"
+        date_from, date_to = d_from, d_to
+    else:
+        date_from, date_to, period_label = determine_period(report_type)
     ym = date_from.strftime("%Y-%m")
     month_name = MONTHS_RU.get(date_from.month, str(date_from.month))
 
@@ -712,6 +724,9 @@ async def build_and_send(report_type: str, debug_override: bool = False):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     kwargs = {"proxy": PROXY_CFG} if PROXY_CFG else {}
+    _own_client = False
+    if "client" not in dir():
+        _own_client = True
     async with TelegramClient(SESSION_NAME, API_ID, API_HASH, **kwargs) as client:
 
         channel_results = []
@@ -811,8 +826,8 @@ async def build_and_send(report_type: str, debug_override: bool = False):
                 archive_monthly(ch, ym)
 
         # Отправка в Telegram
-        if not recipient:
-            log.info("Получатель не задан — отправка пропущена")
+        if not recipients:
+            log.info("Получатели не заданы — отправка пропущена")
             return
 
         files = list(out_dir.glob(f"*_{ym}_{report_type}.xlsx"))
@@ -824,17 +839,18 @@ async def build_and_send(report_type: str, debug_override: bool = False):
             return
 
         debug_tag = " [DEBUG]" if is_debug else ""
-        await client.send_message(
-            recipient,
+        caption = (
             f"📊{debug_tag} Отчёт «{report_type}» | {period_label} | "
             f"{len(files)} файл(ов) | каналов: {len(channel_results)}"
         )
-        for fp in files:
+        for uid in recipients:
             try:
-                await client.send_file(recipient, str(fp), caption=f"📎 {fp.name}")
-                log.info(f"Отправлен: {fp.name}")
+                await client.send_message(uid, caption)
+                for fp in files:
+                    await client.send_file(uid, str(fp), caption=f"📎 {fp.name}")
+                    log.info(f"Отправлен {fp.name} → {uid}")
             except Exception as e:
-                log.error(f"Ошибка отправки {fp.name}: {e}")
+                log.error(f"Ошибка отправки → {uid}: {e}")
 
     log.info("=== Готово ===")
 
