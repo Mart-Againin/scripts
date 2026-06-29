@@ -20,6 +20,7 @@ import logging
 import os
 import sys
 from datetime import datetime, date, timedelta
+import calendar
 from pathlib import Path
 
 import pytz
@@ -63,9 +64,9 @@ log = logging.getLogger(__name__)
 # Кто может отдавать команды — объединяем оба списка
 ALLOWED_SENDERS = set(RECIPIENT_IDS + DEBUG_IDS)
 
-# Состояние диалога для команды /report monthly
-# { sender_id: "awaiting_month" }
-_dialog_state: dict[int, str] = {}
+# Состояние диалога
+# { sender_id: {"state": "awaiting_month"|"awaiting_cache", "month_str": "06", "ym": "2026-06"} }
+_dialog_state: dict = {}
 
 
 # ── Импорт модулей ────────────────────────────────────────────────────────
@@ -81,6 +82,17 @@ def _load_module(name: str):
 
 # ── Авторизация ───────────────────────────────────────────────────────────
 
+def _print_qr(url: str):
+    try:
+        import qrcode
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(url)
+        qr.make(fit=True)
+        qr.print_ascii(invert=True)
+    except ImportError:
+        print(f"  QR URL: {url}")
+
+
 async def authorize(client: TelegramClient) -> bool:
     if await client.is_user_authorized():
         me = await client.get_me()
@@ -92,21 +104,81 @@ async def authorize(client: TelegramClient) -> bool:
     print("  ПЕРВЫЙ ЗАПУСК — необходима авторизация в Telegram")
     print("=" * 55)
     print()
+    print("  Выберите способ:")
+    print("  1 — QR-код (рекомендуется)")
+    print("      Telegram → Настройки → Устройства → Подключить")
+    print("  2 — Номер телефона + код из Telegram")
+    print()
+    choice = input("  Введите 1 или 2: ").strip()
 
-    phone = input("  Введите номер телефона (например +79001234567): ").strip()
-    await client.send_code_request(phone)
-    code = input("  Введите код из Telegram: ").strip()
+    success = False
 
-    try:
-        await client.sign_in(phone, code)
-    except SessionPasswordNeededError:
-        password = input("  Введите пароль двухфакторной аутентификации: ").strip()
-        await client.sign_in(password=password)
+    if choice == "1":
+        print()
+        print("  Сканируйте QR-код в Telegram:")
+        print("  (Настройки → Устройства → Подключить устройство)")
+        print()
+        try:
+            qr_login = await client.qr_login()
+            _print_qr(qr_login.url)
+            print()
+            print("  Ожидаю сканирования", end="", flush=True)
+
+            while True:
+                try:
+                    await qr_login.wait(timeout=20)
+                    print()
+                    success = True
+                    break
+                except asyncio.TimeoutError:
+                    print(".", end="", flush=True)
+                    try:
+                        await qr_login.recreate()
+                        print()
+                        print("  QR обновлён:")
+                        _print_qr(qr_login.url)
+                        print("  Ожидаю сканирования", end="", flush=True)
+                    except Exception:
+                        print()
+                        break
+                except Exception as e:
+                    print()
+                    if "password" in str(e).lower() or "2fa" in str(e).lower():
+                        password = input("  Введите пароль 2FA: ").strip()
+                        try:
+                            await client.sign_in(password=password)
+                            success = True
+                        except Exception as e2:
+                            log.error(f"Ошибка 2FA: {e2}")
+                    else:
+                        log.error(f"Ошибка QR: {e}")
+                    break
+        except Exception as e:
+            log.error(f"QR недоступен: {e}")
+
+    else:
+        phone = input("  Введите номер телефона (+79001234567): ").strip()
+        try:
+            await client.send_code_request(phone)
+            code = input("  Введите код из Telegram: ").strip()
+            try:
+                await client.sign_in(phone, code)
+                success = True
+            except SessionPasswordNeededError:
+                password = input("  Введите пароль 2FA: ").strip()
+                await client.sign_in(password=password)
+                success = True
+        except Exception as e:
+            log.error(f"Ошибка авторизации: {e}")
+
+    if not success:
+        print()
+        print("  ❌ Авторизация не удалась. Перезапустите скрипт.")
+        sys.exit(1)
 
     me = await client.get_me()
     print()
-    print(f"  ✅ Авторизован: {me.first_name} (@{me.username})")
-    print(f"  Ваш Telegram ID: {me.id}")
+    print(f"  ✅ Авторизован: {me.first_name} (@{me.username}) ID={me.id}")
     print()
 
     if not RECIPIENT_IDS:
@@ -122,23 +194,33 @@ async def authorize(client: TelegramClient) -> bool:
 # ── Отправка отчёта ───────────────────────────────────────────────────────
 
 async def run_report(client: TelegramClient, report_type: str,
-                     month_str: str = None, force_debug: bool = False):
-    """
-    Запускает генерацию отчёта и отправляет результат.
-    month_str — только для monthly, формат 'MM' (например '05').
-    """
+                     force_debug: bool = False,
+                     month_override: str = None,
+                     week_offset: int = 1,
+                     week_date=None):
+    """Запускает генерацию отчёта. Передаёт уже открытый клиент."""
     rep = _load_module("report")
+    await rep.build_and_send(report_type, debug_override=force_debug,
+                             month_override=month_override, tg_client=client,
+                             week_offset=week_offset, week_date=week_date)
 
-    # Для месячного с указанным месяцем — переопределяем период
-    if report_type == "monthly" and month_str:
-        year = datetime.now(TZ).year
-        # Если указанный месяц >= текущего — берём прошлый год
-        if int(month_str) >= datetime.now(TZ).month:
-            year -= 1
-        ym = f"{year}-{month_str}"
-        await rep.build_and_send("monthly", debug_override=force_debug, month_override=ym)
-    else:
-        await rep.build_and_send(report_type, debug_override=force_debug)
+
+async def send_cached_report(client: TelegramClient, ym: str, sender_id: int):
+    """Отправляет уже готовый файл отчёта из кэша."""
+    rep = _load_module("report")
+    path = rep.get_cached_report_path(ym)
+    if not path:
+        await client.send_message(sender_id, "❌ Файл не найден, генерирую заново...")
+        return False
+    is_debug = DEBUG_MODE
+    recipients = DEBUG_IDS if is_debug else RECIPIENT_IDS
+    for uid in recipients:
+        try:
+            await client.send_file(uid, str(path), caption=f"📎 {path.name}")
+            log.info(f"Отправлен кэш {path.name} → {uid}")
+        except Exception as e:
+            log.error(f"Ошибка отправки кэша → {uid}: {e}")
+    return True
 
 
 async def send_to_all(client: TelegramClient, text: str, is_debug: bool = False):
@@ -174,16 +256,22 @@ def register_command_handler(client: TelegramClient):
                 log.error(f"Ошибка /report daily: {e}", exc_info=DEBUG_MODE)
 
         elif args == "weekly":
-            await event.reply("⏳ Генерирую недельный отчёт...")
-            try:
-                await run_report(client, "weekly", force_debug=DEBUG_MODE)
-            except Exception as e:
-                await event.reply(f"❌ Ошибка: {e}")
-                log.error(f"Ошибка /report weekly: {e}", exc_info=DEBUG_MODE)
+            from datetime import date as _date, timedelta as _td
+            today = _date.today()
+            mon1  = today - _td(days=today.weekday() + 7)
+            sun1  = mon1  + _td(days=6)
+            mon2  = mon1  - _td(days=7)
+            sun2  = mon2  + _td(days=6)
+            _dialog_state[sender_id] = {"state": "awaiting_week"}
+            await event.reply(
+                f"📆 За какую неделю сформировать отчёт?\n\n"
+                f"1 — прошлая неделя ({mon1.strftime('%d.%m')} – {sun1.strftime('%d.%m')})\n"
+                f"2 — позапрошлая ({mon2.strftime('%d.%m')} – {sun2.strftime('%d.%m')})\n"
+                f"3 — указать вручную (любой день нужной недели)"
+            )
 
         elif args == "monthly":
-            # Начинаем диалог — спрашиваем месяц
-            _dialog_state[sender_id] = "awaiting_month"
+            _dialog_state[sender_id] = {"state": "awaiting_month"}
             await event.reply(
                 "📅 За какой месяц сформировать отчёт?\n"
                 "Введите двузначный номер месяца, например:\n"
@@ -199,44 +287,247 @@ def register_command_handler(client: TelegramClient):
                 "/report monthly — месячный отчёт (спросит период)"
             )
 
-    @client.on(events.NewMessage(incoming=True))
-    async def handle_dialog(event):
+    @client.on(events.NewMessage(pattern=r"^/backfill$", incoming=True))
+    async def handle_backfill(event):
         sender_id = event.sender_id
         if sender_id not in ALLOWED_SENDERS:
             return
-        if _dialog_state.get(sender_id) != "awaiting_month":
+        log.info(f"Команда /backfill от {sender_id}")
+        _dialog_state[sender_id] = {"state": "awaiting_backfill_type"}
+        await event.reply(
+            "📥 Ретро-сбор исторических данных.\n"
+            "Выберите период:\n\n"
+            "1 — конкретный месяц\n"
+            "2 — конкретная неделя\n"
+            "3 — с января по текущий месяц"
+        )
+
+    @client.on(events.NewMessage())
+    async def handle_dialog(event):
+        sender_id = event.sender_id
+        if sender_id is None or event.out:
+            me = await client.get_me()
+            sender_id = me.id
+
+        if sender_id not in ALLOWED_SENDERS:
+            return
+        state_data = _dialog_state.get(sender_id)
+        if not state_data:
+            return
+        if event.raw_text.strip().startswith("/"):
             return
 
-        text = event.raw_text.strip()
+        text  = event.raw_text.strip()
+        state = state_data.get("state")
 
-        # Валидация: двузначное число от 01 до 12
-        if not text.isdigit() or not (1 <= int(text) <= 12):
-            await event.reply(
-                "⚠️ Неверный формат. Введите двузначный номер месяца от 01 до 12.\n"
-                "Например: 05"
-            )
-            return
-
-        month_str = text.zfill(2)  # '5' → '05'
-        del _dialog_state[sender_id]
-
-        year = datetime.now(TZ).year
-        if int(month_str) >= datetime.now(TZ).month:
-            year -= 1
-
-        month_names = {
+        MONTH_NAMES = {
             "01":"январь","02":"февраль","03":"март","04":"апрель",
             "05":"май","06":"июнь","07":"июль","08":"август",
             "09":"сентябрь","10":"октябрь","11":"ноябрь","12":"декабрь",
         }
-        month_name = month_names.get(month_str, month_str)
 
-        await event.reply(f"⏳ Генерирую месячный отчёт за {month_name} {year}...")
-        try:
-            await run_report(client, "monthly", month_str=month_str, force_debug=DEBUG_MODE)
-        except Exception as e:
-            await event.reply(f"❌ Ошибка: {e}")
-            log.error(f"Ошибка /report monthly {month_str}: {e}", exc_info=DEBUG_MODE)
+        # ── Выбор недели ─────────────────────────────────────────────────
+        if state == "awaiting_week":
+            if text == "1":
+                del _dialog_state[sender_id]
+                await event.reply("⏳ Генерирую недельный отчёт за прошлую неделю...")
+                try:
+                    await run_report(client, "weekly", force_debug=DEBUG_MODE, week_offset=1)
+                except Exception as e:
+                    await event.reply(f"❌ Ошибка: {e}")
+
+            elif text == "2":
+                del _dialog_state[sender_id]
+                await event.reply("⏳ Генерирую недельный отчёт за позапрошлую неделю...")
+                try:
+                    await run_report(client, "weekly", force_debug=DEBUG_MODE, week_offset=2)
+                except Exception as e:
+                    await event.reply(f"❌ Ошибка: {e}")
+
+            elif text == "3":
+                _dialog_state[sender_id] = {"state": "awaiting_week_date"}
+                await event.reply(
+                    "📅 Введите любой день нужной недели в формате ДД.ММ\n"
+                    "Например: 15.05"
+                )
+            else:
+                await event.reply("⚠️ Введите 1, 2 или 3")
+
+        # ── Ввод даты для недели ─────────────────────────────────────────
+        elif state == "awaiting_week_date":
+            try:
+                parts = text.split(".")
+                if len(parts) == 2:
+                    day, month = int(parts[0]), int(parts[1])
+                    year = datetime.now(TZ).year
+                    if month > datetime.now(TZ).month:
+                        year -= 1
+                    week_date = date(year, month, day)
+                else:
+                    raise ValueError()
+            except (ValueError, IndexError):
+                await event.reply("⚠️ Неверный формат. Введите дату в формате ДД.ММ, например: 15.05")
+                return
+
+            from datetime import timedelta as _td
+            mon = week_date - _td(days=week_date.weekday())
+            sun = mon + _td(days=6)
+            del _dialog_state[sender_id]
+            await event.reply(f"⏳ Генерирую недельный отчёт за {mon.strftime('%d.%m')}–{sun.strftime('%d.%m.%Y')}...")
+            try:
+                await run_report(client, "weekly", force_debug=DEBUG_MODE, week_date=week_date)
+            except Exception as e:
+                await event.reply(f"❌ Ошибка: {e}")
+
+        # ── Ожидаем номер месяца ─────────────────────────────────────────
+        elif state == "awaiting_month":
+            if not text.isdigit() or not (1 <= int(text) <= 12):
+                await event.reply("⚠️ Неверный формат. Введите номер месяца от 01 до 12.\nНапример: 05")
+                return
+
+            month_str  = text.zfill(2)
+            year       = datetime.now(TZ).year
+            if int(month_str) >= datetime.now(TZ).month:
+                year -= 1
+            ym         = f"{year}-{month_str}"
+            month_name = MONTH_NAMES.get(month_str, month_str)
+
+            rep         = _load_module("report")
+            cached_info = rep.get_cached_report_info(ym)
+
+            if cached_info:
+                _dialog_state[sender_id] = {
+                    "state": "awaiting_cache", "ym": ym,
+                    "month_name": month_name, "year": year,
+                }
+                await event.reply(
+                    f"📁 Отчёт за {month_name} {year} уже сформирован ({cached_info}).\n\n"
+                    f"Что сделать?\n"
+                    f"1 — отправить готовый\n"
+                    f"2 — пересчитать заново"
+                )
+            else:
+                del _dialog_state[sender_id]
+                await event.reply(f"⏳ Генерирую месячный отчёт за {month_name} {year}...")
+                try:
+                    await run_report(client, "monthly", force_debug=DEBUG_MODE, month_override=ym)
+                except Exception as e:
+                    await event.reply(f"❌ Ошибка: {e}")
+
+        # ── Готовый или пересчитать ───────────────────────────────────────
+        elif state == "awaiting_cache":
+            ym         = state_data["ym"]
+            month_name = state_data["month_name"]
+            year       = state_data["year"]
+
+            if text == "1":
+                del _dialog_state[sender_id]
+                await event.reply(f"📤 Отправляю готовый отчёт за {month_name} {year}...")
+                ok = await send_cached_report(client, ym, sender_id)
+                if not ok:
+                    await event.reply("⏳ Файл не найден, генерирую заново...")
+                    try:
+                        await run_report(client, "monthly", force_debug=DEBUG_MODE, month_override=ym)
+                    except Exception as e:
+                        await event.reply(f"❌ Ошибка: {e}")
+            elif text == "2":
+                del _dialog_state[sender_id]
+                await event.reply(f"⏳ Пересчитываю отчёт за {month_name} {year}...")
+                try:
+                    await run_report(client, "monthly", force_debug=DEBUG_MODE, month_override=ym)
+                except Exception as e:
+                    await event.reply(f"❌ Ошибка: {e}")
+            else:
+                await event.reply("⚠️ Введите 1 (готовый) или 2 (пересчитать)")
+
+        # ── Backfill: выбор типа периода ─────────────────────────────────
+        elif state == "awaiting_backfill_type":
+            if text == "1":
+                _dialog_state[sender_id] = {"state": "awaiting_backfill_month"}
+                await event.reply(
+                    "📅 Введите номер месяца для ретро-сбора (формат ММ):\n"
+                    "Например: 05 — май"
+                )
+            elif text == "2":
+                _dialog_state[sender_id] = {"state": "awaiting_backfill_week"}
+                await event.reply(
+                    "📅 Введите любой день нужной недели (формат ДД.ММ):\n"
+                    "Например: 15.05"
+                )
+            elif text == "3":
+                del _dialog_state[sender_id]
+                year = datetime.now(TZ).year
+                await event.reply(f"⏳ Запускаю ретро-сбор с января по текущий месяц {year}...")
+                try:
+                    hist = _load_module("historical")
+                    channels = [c.strip() for c in os.getenv("CHANNELS","").split(",") if c.strip()]
+                    cur_month = datetime.now(TZ).month
+                    for mo in range(1, cur_month):
+                        ym = f"{year}-{mo:02d}"
+                        await event.reply(f"  Собираю {ym}...")
+                        for ch in channels:
+                            await hist.fetch_and_cache_month(client, ch, ym, force=False)
+                    await event.reply(f"✅ Ретро-сбор завершён. Данные за {year} доступны.")
+                except Exception as e:
+                    await event.reply(f"❌ Ошибка: {e}")
+            else:
+                await event.reply("⚠️ Введите 1, 2 или 3")
+
+        # ── Backfill: конкретный месяц ────────────────────────────────────
+        elif state == "awaiting_backfill_month":
+            if not text.isdigit() or not (1 <= int(text) <= 12):
+                await event.reply("⚠️ Неверный формат. Введите номер месяца от 01 до 12.")
+                return
+            month_str  = text.zfill(2)
+            year       = datetime.now(TZ).year
+            if int(month_str) >= datetime.now(TZ).month:
+                year -= 1
+            ym         = f"{year}-{month_str}"
+            month_name = MONTH_NAMES.get(month_str, month_str)
+            del _dialog_state[sender_id]
+            await event.reply(f"⏳ Ретро-сбор за {month_name} {year}...")
+            try:
+                hist     = _load_module("historical")
+                channels = [c.strip() for c in os.getenv("CHANNELS","").split(",") if c.strip()]
+                for ch in channels:
+                    await hist.fetch_and_cache_month(client, ch, ym, force=False)
+                await event.reply(f"✅ Данные за {month_name} {year} сохранены в кэш.")
+            except Exception as e:
+                await event.reply(f"❌ Ошибка: {e}")
+
+        # ── Backfill: конкретная неделя ───────────────────────────────────
+        elif state == "awaiting_backfill_week":
+            try:
+                parts = text.split(".")
+                day, month = int(parts[0]), int(parts[1])
+                year = datetime.now(TZ).year
+                if month > datetime.now(TZ).month:
+                    year -= 1
+                week_date = date(year, month, day)
+            except (ValueError, IndexError):
+                await event.reply("⚠️ Неверный формат. Введите дату в формате ДД.ММ")
+                return
+
+            from datetime import timedelta as _td
+            mon = week_date - _td(days=week_date.weekday())
+            sun = mon + _td(days=6)
+            del _dialog_state[sender_id]
+            await event.reply(f"⏳ Ретро-сбор за {mon.strftime('%d.%m')}–{sun.strftime('%d.%m.%Y')}...")
+            try:
+                hist     = _load_module("historical")
+                channels = [c.strip() for c in os.getenv("CHANNELS","").split(",") if c.strip()]
+                # Неделя может захватить два месяца
+                months = set()
+                d = mon
+                while d <= sun:
+                    months.add(d.strftime("%Y-%m"))
+                    d += _td(days=1)
+                for ym in sorted(months):
+                    for ch in channels:
+                        await hist.fetch_and_cache_month(client, ch, ym, force=False)
+                await event.reply(f"✅ Данные за {mon.strftime('%d.%m')}–{sun.strftime('%d.%m.%Y')} сохранены.")
+            except Exception as e:
+                await event.reply(f"❌ Ошибка: {e}")
 
 
 # ── Расписание ────────────────────────────────────────────────────────────
@@ -370,7 +661,9 @@ async def main():
     print("  Для остановки нажмите Ctrl+C")
     print()
 
-    async with TelegramClient(SESSION_NAME, API_ID, API_HASH, **kwargs) as client:
+    client = TelegramClient(SESSION_NAME, API_ID, API_HASH, **kwargs)
+    await client.connect()
+    try:
         await authorize(client)
         register_command_handler(client)
 
@@ -386,6 +679,8 @@ async def main():
             except Exception as e:
                 log.error(f"Ошибка в tick: {e}", exc_info=DEBUG_MODE)
             await asyncio.sleep(60)
+    finally:
+        await client.disconnect()
 
 
 if __name__ == "__main__":
