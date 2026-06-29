@@ -286,7 +286,7 @@ async def get_channel_posts(client, channel_username: str,
 
     # Нет 24ч срезов — берём исторические
     posts, subs = await hist_mod.get_posts_for_period(
-        client, channel_username, date_from, date_to)
+        client, channel_username, date_from, date_to, force=force_historical)
     if subs: subscribers = subs
     return posts, subscribers, True
 
@@ -796,7 +796,8 @@ def determine_period(report_type: str,
 # ── Главная функция ───────────────────────────────────────────────────────
 async def build_and_send(report_type: str, debug_override: bool = False,
                          month_override: str = None, tg_client=None,
-                         week_offset: int = 1, week_date: date = None):
+                         week_offset: int = 1, week_date: date = None,
+                         force_rebuild: bool = False):
     is_debug   = DEBUG_MODE or debug_override
     recipients = DEBUG_IDS if is_debug else RECIPIENT_IDS
     channels   = [c.strip() for c in CHANNELS_RAW.split(",") if c.strip()]
@@ -823,7 +824,7 @@ async def build_and_send(report_type: str, debug_override: bool = False,
         channels_data = []
         for ch in channels:
             posts, subs, is_hist = await get_channel_posts(
-                client, ch, d_from, d_to)
+                client, ch, d_from, d_to, force_historical=force_rebuild)
             channels_data.append({
                 "channel_id":   ch,
                 "subscribers":  subs,

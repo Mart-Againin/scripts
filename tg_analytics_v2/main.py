@@ -197,12 +197,14 @@ async def run_report(client: TelegramClient, report_type: str,
                      force_debug: bool = False,
                      month_override: str = None,
                      week_offset: int = 1,
-                     week_date=None):
+                     week_date=None,
+                     force_rebuild: bool = False):
     """Запускает генерацию отчёта. Передаёт уже открытый клиент."""
     rep = _load_module("report")
     await rep.build_and_send(report_type, debug_override=force_debug,
                              month_override=month_override, tg_client=client,
-                             week_offset=week_offset, week_date=week_date)
+                             week_offset=week_offset, week_date=week_date,
+                             force_rebuild=force_rebuild)
 
 
 async def send_cached_report(client: TelegramClient, ym: str, sender_id: int):

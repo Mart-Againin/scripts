@@ -158,6 +158,16 @@ async def fetch_and_cache_month(client, channel_username: str,
     title       = getattr(entity, "title", username)
     subscribers = getattr(entity, "participants_count", 0) or 0
 
+    # Если participants_count не вернулся — делаем полный запрос канала
+    if not subscribers:
+        try:
+            from telethon.tl.functions.channels import GetFullChannelRequest
+            full = await client(GetFullChannelRequest(entity))
+            subscribers = getattr(full.full_chat, "participants_count", 0) or 0
+            log.debug(f"  [{channel_username}] Подписчиков (full): {subscribers}")
+        except Exception as e:
+            log.warning(f"  [{channel_username}] Не удалось получить подписчиков: {e}")
+
     # Временные границы в UTC
     day_end   = datetime(d_to.year,   d_to.month,   d_to.day,   23, 59, 59, tzinfo=timezone.utc)
     day_start = datetime(d_from.year, d_from.month, d_from.day,  0,  0,  0, tzinfo=timezone.utc)
@@ -172,7 +182,7 @@ async def fetch_and_cache_month(client, channel_username: str,
         msg_date_utc = msg.date.replace(tzinfo=timezone.utc)
         if msg_date_utc < day_start:
             break
-        if msg.service or not msg.id:
+        if getattr(msg, "service", False) or not msg.id:
             continue
 
         reactions = 0
