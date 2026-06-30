@@ -50,7 +50,7 @@
 ## Установка
 
 ```bash
-git clone https://github.com/your-username/tg-analytics.git
+git clone https://github.com/Mart-Againin/scripts/blob/main/tg_analytics_v2/tg-analytics.git
 cd tg-analytics
 pip install -r requirements.txt
 cp .env.example .env
