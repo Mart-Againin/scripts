@@ -172,7 +172,9 @@ async def fetch_and_cache_month(client, channel_username: str,
     day_end   = datetime(d_to.year,   d_to.month,   d_to.day,   23, 59, 59, tzinfo=timezone.utc)
     day_start = datetime(d_from.year, d_from.month, d_from.day,  0,  0,  0, tzinfo=timezone.utc)
 
-    posts = []
+    raw_posts = []   # все сообщения до дедупликации
+    grouped_map = {} # grouped_id → список msg
+
     async for msg in client.iter_messages(
         entity,
         offset_date=day_end + timedelta(seconds=1),
@@ -185,6 +187,21 @@ async def fetch_and_cache_month(client, channel_username: str,
         if getattr(msg, "service", False) or not msg.id:
             continue
 
+        grouped_id = getattr(msg, "grouped_id", None)
+        if grouped_id:
+            grouped_map.setdefault(grouped_id, []).append(msg)
+        else:
+            raw_posts.append(msg)
+
+    # Из каждого альбома берём сообщение с наименьшим msg_id
+    # (первое фото альбома — у него привязаны реакции и комментарии)
+    for group_msgs in grouped_map.values():
+        first = min(group_msgs, key=lambda m: m.id)
+        raw_posts.append(first)
+
+    posts = []
+    for msg in raw_posts:
+
         reactions = 0
         if msg.reactions and msg.reactions.results:
             reactions = sum(r.count for r in msg.reactions.results)
@@ -192,9 +209,10 @@ async def fetch_and_cache_month(client, channel_username: str,
         forwards = msg.forwards or 0
         votes    = _extract_poll_votes(msg)
         views    = msg.views or 0
-        actions  = views + reactions + comments + forwards + votes
+        # Действия = только активные действия пользователей (без охвата)
+        actions  = reactions + comments + forwards + votes
 
-        pub_local = msg_date_utc.astimezone(TZ)
+        pub_local = msg.date.replace(tzinfo=timezone.utc).astimezone(TZ)
 
         posts.append({
             "msg_id":        msg.id,

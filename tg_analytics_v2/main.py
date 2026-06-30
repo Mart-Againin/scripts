@@ -434,9 +434,10 @@ def register_command_handler(client: TelegramClient):
                         await event.reply(f"❌ Ошибка: {e}")
             elif text == "2":
                 del _dialog_state[sender_id]
-                await event.reply(f"⏳ Пересчитываю отчёт за {month_name} {year}...")
+                await event.reply(f"⏳ Пересчитываю отчёт за {month_name} {year} (кэш сбрасывается)...")
                 try:
-                    await run_report(client, "monthly", force_debug=DEBUG_MODE, month_override=ym)
+                    await run_report(client, "monthly", force_debug=DEBUG_MODE,
+                                     month_override=ym, force_rebuild=True)
                 except Exception as e:
                     await event.reply(f"❌ Ошибка: {e}")
             else:
@@ -573,10 +574,20 @@ async def tick(client: TelegramClient):
             channels = [c.strip() for c in os.getenv("CHANNELS","").split(",") if c.strip()]
             for ch in channels:
                 await snap.process_channel(client, ch)
-            _last_snapshot = now
-            log.info("✓ Сборщик завершён")
+            log.info("✓ Сборщик постов завершён")
         except Exception as e:
-            log.error(f"Ошибка сборщика: {e}", exc_info=DEBUG_MODE)
+            log.error(f"Ошибка сборщика постов: {e}", exc_info=DEBUG_MODE)
+
+        try:
+            stories_mod = _load_module("stories")
+            channels = [c.strip() for c in os.getenv("CHANNELS","").split(",") if c.strip()]
+            for ch in channels:
+                await stories_mod.process_channel_stories(client, ch)
+            log.info("✓ Сборщик сторис завершён")
+        except Exception as e:
+            log.error(f"Ошибка сборщика сторис: {e}", exc_info=DEBUG_MODE)
+
+        _last_snapshot = now
 
     # ── Суточный (только DEBUG) ───────────────────────────────────────────
     if should_run_daily_report() and _last_daily != today:

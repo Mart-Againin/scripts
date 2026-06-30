@@ -164,12 +164,13 @@ def calc(snap: dict, subscribers: int) -> dict:
     sub= subscribers or 0
     cqi_raw = (r * CQI_W["react"] + vt * CQI_W["vote"] +
                f * CQI_W["forward"] + c * CQI_W["comment"])
+    # Действия = только активные действия (без охвата)
+    act_clean = r + c + f + vt
     return {
         "views": v, "reactions": r, "comments": c,
-        "forwards": f, "votes": vt, "actions": act,
-        "err":    safe_div(act,     v,   pct=True),
+        "forwards": f, "votes": vt, "actions": act_clean,
+        "err":    safe_div(act_clean, v,   pct=True),
         "er":     safe_div(r+c+f+vt, sub, pct=True),
-        "erview": safe_div(r+c+f+vt, v,   pct=True),
         "vrpost": safe_div(v,        sub, pct=True),
         "vf":     safe_div(f,        v,   pct=True),
         "reply":  safe_div(c,        v,   pct=True),
@@ -206,7 +207,6 @@ POST_COLS = [
     ("Действия",     "actions",      12, False, False),
     ("ERR (%)",      "err",          10, True,  False),
     ("ER (%)",       "er",           10, True,  False),
-    ("ERview (%)",   "erview",       11, True,  False),
     ("VRpost (%)",   "vrpost",       11, True,  False),
     ("Viral F. (%)", "vf",           12, True,  False),
     ("Reply R. (%)", "reply",        12, True,  False),
@@ -323,7 +323,7 @@ def _write_post_row(ws, r: int, p: dict, subscribers: int, bg: str):
 
 def _channel_totals_row(ws, r: int, posts: list, subscribers: int, ch_id: str):
     totals = {k: 0 for k in ["views","reactions","comments","forwards","votes","actions"]}
-    mlists = {k: [] for k in ["err","er","erview","vrpost","vf","reply","poll","rm","cqi"]}
+    mlists = {k: [] for k in ["err","er","vrpost","vf","reply","poll","rm","cqi"]}
     best   = None
     for p in posts:
         sn = p.get("snapshot", {})
@@ -429,16 +429,20 @@ def build_multichannel_posts_sheet(ws, channels_data: list,
 
 # ── Сводный лист ──────────────────────────────────────────────────────────
 SUMMARY_COLS = [
-    ("Канал",              22), ("Подписчики",      13), ("Постов",          10),
-    ("Охват (сумм.)",      13), ("Реакции (сумм.)", 13), ("Комменты (сумм.)",13),
-    ("Пересылки (сумм.)",  14), ("Голоса (сумм.)",  12), ("Действия (сумм.)",14),
-    ("Ср. ERR (%)",        11), ("Ср. ER (%)",      11), ("Ср. ERview (%)",  12),
-    ("Ср. VRpost (%)",     12), ("Ср. Viral F.(%)", 13), ("Ср. Reply R.(%)", 13),
-    ("Ср. Reach Mult.",    13), ("Ср. CQI",         10), ("Топ формат",      14),
-    ("Лучший пост (CQI)",  28), ("Данные",          16),
+    ("Канал",              22), ("Подписчики",      13),
+    ("+сегодня",           10), ("+неделя",          10), ("+месяц",           10),
+    ("Постов",             10), ("Сторис",           10),
+    ("Охват постов",       14), ("Охват сторис",     14), ("Общий охват",      14),
+    ("Реакции (сумм.)",    13), ("Комменты (сумм.)", 13),
+    ("Пересылки (сумм.)",  14), ("Голоса (сумм.)",   12), ("Действия (сумм.)", 14),
+    ("Ср. ERR (%)",        11), ("Ср. ER (%)",       11),
+    ("Ср. VRpost (%)",     12), ("Ср. Viral F.(%)",  13), ("Ср. Reply R.(%)",  13),
+    ("Ср. Reach Mult.",    13), ("Ср. CQI",          10), ("Топ формат",       14),
+    ("Лучший пост (CQI)",  28), ("Данные",           16),
 ]
-PCT_SUM   = {10,11,12,13,14,15}
-FLOAT_SUM = {16,17}
+# Индексы под новую раскладку (считая с 1)
+PCT_SUM   = {16,17,18,19,20}
+FLOAT_SUM = {21,22}
 
 def build_summary_sheet(ws, results: list, label: str, subtitle: str):
     n = len(SUMMARY_COLS)
@@ -448,6 +452,8 @@ def build_summary_sheet(ws, results: list, label: str, subtitle: str):
         ws.column_dimensions[get_column_letter(i)].width = width
     ws.row_dimensions[hdr_row].height = 30
 
+    GROWTH_COLS = {3, 4, 5}  # +сегодня, +неделя, +месяц — могут быть отрицательными
+
     for idx, cr in enumerate(results):
         r       = hdr_row + 1 + idx
         bg      = C["white"] if idx%2==0 else C["gray"]
@@ -456,11 +462,21 @@ def build_summary_sheet(ws, results: list, label: str, subtitle: str):
         top_fmt = tf[0][0] if tf else "—"
         best_url= cr["best"]["url"] if cr.get("best") else "—"
         dtype   = "📜 Исторические" if cr.get("is_historical") else "✅ 24ч срезы"
-        row_v   = [
-            cr["channel_id"], cr["subscribers"], cr["count"],
-            t.get("views"), t.get("reactions"), t.get("comments"),
+
+        growth       = cr.get("growth", {})
+        stories_data = cr.get("stories", {})
+        views_posts  = t.get("views") or 0
+        views_stories= stories_data.get("views", 0)
+        views_total  = views_posts + views_stories
+
+        row_v = [
+            cr["channel_id"], cr["subscribers"],
+            growth.get("today"), growth.get("week"), growth.get("month"),
+            cr["count"], stories_data.get("count", 0),
+            views_posts, views_stories, views_total,
+            t.get("reactions"), t.get("comments"),
             t.get("forwards"), t.get("votes"), t.get("actions"),
-            a.get("err"), a.get("er"), a.get("erview"), a.get("vrpost"),
+            a.get("err"), a.get("er"), a.get("vrpost"),
             a.get("vf"), a.get("reply"), a.get("rm"), a.get("cqi"),
             top_fmt, best_url, dtype,
         ]
@@ -470,39 +486,73 @@ def build_summary_sheet(ws, results: list, label: str, subtitle: str):
             cell.font      = _f(sz=10)
             cell.border    = _b()
             cell.alignment = _align(h="left" if i==1 else "center")
-            if v is None:            cell.value = "—"
-            elif i in PCT_SUM:       fv(cell, v, pct=True)
-            elif i in FLOAT_SUM:     fv(cell, v, flt=True)
-            elif i in {2,3,4,5,6,7,8,9}: fv(cell, v)
-            else:                    cell.value = v
+            if v is None:
+                cell.value = "—"
+            elif i in GROWTH_COLS:
+                cell.value = f"+{v}" if v > 0 else str(v)
+                cell.font  = _f(sz=10, bold=True,
+                                color="2E7D32" if v > 0 else ("C62828" if v < 0 else "666666"))
+            elif i in PCT_SUM:
+                fv(cell, v, pct=True)
+            elif i in FLOAT_SUM:
+                fv(cell, v, flt=True)
+            elif i in {2,6,7,8,9,10,11,12,13,14,15}:
+                fv(cell, v)
+            else:
+                cell.value = v
         ws.row_dimensions[r].height = 22
 
     rt = hdr_row + 1 + len(results)
-    ws.merge_cells(f"A{rt}:C{rt}")
+    ws.merge_cells(f"A{rt}:B{rt}")
     ws[f"A{rt}"].value     = "ИТОГО / СРЕДНЕЕ"
     ws[f"A{rt}"].font      = _f(bold=True, sz=10)
     ws[f"A{rt}"].fill      = _fill(C["yellow"])
     ws[f"A{rt}"].alignment = _align()
     ws[f"A{rt}"].border    = _b()
-    for j in [2, 3]:
-        ws.cell(row=rt, column=j).fill   = _fill(C["yellow"])
-        ws.cell(row=rt, column=j).border = _b()
-    keys = ["","","","views","reactions","comments","forwards","votes","actions",
-            "err","er","erview","vrpost","vf","reply","rm","cqi"]
-    for j in range(4, n+1):
+
+    SUM_COLS = {6,7,8,9,10,11,12,13,14}
+    keys = ["","","","","","count","_stories_count","_views_posts","_views_stories","_views_total",
+            "reactions","comments","forwards","votes","actions",
+            "err","er","vrpost","vf","reply","rm","cqi"]
+    for j in range(3, n+1):
         cell = ws.cell(row=rt, column=j)
         cell.fill = _fill(C["yellow"]); cell.font = _f(bold=True, sz=10)
         cell.border = _b(); cell.alignment = _align()
         key = keys[j-1] if j-1 < len(keys) else ""
-        if j in {4,5,6,7,8,9}:
+
+        if j in GROWTH_COLS:
+            cell.value = "—"
+        elif key == "count":
+            fv(cell, sum(cr["count"] for cr in results))
+        elif key == "_stories_count":
+            fv(cell, sum(cr.get("stories",{}).get("count",0) for cr in results))
+        elif key == "_views_posts":
+            fv(cell, sum(cr["totals"].get("views",0) for cr in results))
+        elif key == "_views_stories":
+            fv(cell, sum(cr.get("stories",{}).get("views",0) for cr in results))
+        elif key == "_views_total":
+            tv = sum(cr["totals"].get("views",0) for cr in results)
+            sv = sum(cr.get("stories",{}).get("views",0) for cr in results)
+            fv(cell, tv+sv)
+        elif key in {"reactions","comments","forwards","votes","actions"}:
             fv(cell, sum(cr["totals"].get(key,0) for cr in results))
         elif j in PCT_SUM:
             fv(cell, lavg([cr["avgs"].get(key) for cr in results]), pct=True)
         elif j in FLOAT_SUM:
             fv(cell, lavg([cr["avgs"].get(key) for cr in results]), flt=True)
-        else: cell.value = "—"
+        else:
+            cell.value = "—"
     ws.row_dimensions[rt].height = 22
     brd(ws, hdr_row, rt, 1, n)
+
+    # Пометка о динамике подписчиков
+    rn = rt + 2
+    ws.merge_cells(f"A{rn}:{get_column_letter(n)}{rn}")
+    ws[f"A{rn}"].value = ("ℹ️  Колонки «+сегодня / +неделя / +месяц» показывают прирост подписчиков. "
+        "Данные накапливаются с момента запуска скрипта — если истории меньше нужного периода, ячейка будет «—».")
+    ws[f"A{rn}"].font      = _f(sz=9, italic=True, color="595959")
+    ws[f"A{rn}"].alignment = _align(h="left")
+    ws.row_dimensions[rn].height = 18
 
 # ── Агрегатный лист (По дням / По неделям) — канал за каналом ────────────
 AGG_COLS_DAY = [
@@ -674,6 +724,16 @@ def build_agg_multichannel(ws, channels_data: list,
 
 # ── Лист пояснений ────────────────────────────────────────────────────────
 LEGEND = [
+    ("+сегодня / +неделя / +месяц", "Прирост = подписчики сегодня − подписчики N дней назад",
+     "Динамика подписчиков. Накапливается с момента запуска скрипта — если истории меньше нужного периода, будет «—»", "Базовые данные"),
+    ("Сторис",                "Telegram API: stories.GetPinnedStories / GetStoriesArchive",
+     "Количество сторис опубликованных каналом за период. Учитываются только сторис, отслеженные скриптом (с момента запуска)", "Базовые данные"),
+    ("Охват постов",          "Сумма Views по всем постам периода",
+     "Просмотры обычных постов канала", "Базовые данные"),
+    ("Охват сторис",          "Сумма просмотров сторис за период",
+     "Доступно для всех публичных сторис. Реакции на сторис доступны только если вы администратор канала", "Базовые данные"),
+    ("Общий охват",           "Охват постов + Охват сторис",
+     "Суммарный охват всего контента канала за период", "Базовые данные"),
     ("Охват (Views)",        "Telegram API: message.views",
      "Суммарное число просмотров поста на момент сбора данных", "Базовые данные"),
     ("Реакции (React)",      "Telegram API: сумма всех реакций",
@@ -690,8 +750,6 @@ LEGEND = [
      "Доля просмотревших, совершивших хоть какое-то действие. Норма: 3–8%", "Коэффициенты"),
     ("ER (%)",               "(React+Comments+Fwd+Votes) / Подписчики × 100%",
      "Классический ER. Не зависит от алгоритмов показа", "Коэффициенты"),
-    ("ERview (%)",           "(React+Comments+Fwd+Votes) / Views × 100%",
-     "Насколько аудитория, увидевшая пост, реагирует на него", "Коэффициенты"),
     ("VRpost (%)",           "Views / Подписчики × 100%",
      "Какой % подписчиков увидел пост", "Коэффициенты"),
     ("Viral Factor (%)",     "Forwards / Views × 100%",
@@ -848,10 +906,53 @@ async def build_and_send(report_type: str, debug_override: bool = False,
                 "Накопленная статистика на дату сбора.",
             )
             # Сводку строим из results_mo
+            # Подмешиваем данные о приросте подписчиков и сторис
+            import importlib.util as _ilu
+            _snap_spec = _ilu.spec_from_file_location(
+                "snapshot", Path(__file__).parent / "snapshot.py")
+            _snap_mod = _ilu.module_from_spec(_snap_spec)
+            _snap_spec.loader.exec_module(_snap_mod)
+
+            try:
+                _stories_spec = _ilu.spec_from_file_location(
+                    "stories", Path(__file__).parent / "stories.py")
+                _stories_mod = _ilu.module_from_spec(_stories_spec)
+                _stories_spec.loader.exec_module(_stories_mod)
+            except Exception as e:
+                log.warning(f"Модуль stories.py недоступен: {e}")
+                _stories_mod = None
+
+            for cr in results_mo:
+                ch_id = cr["channel_id"]
+                cr["growth"] = _snap_mod.get_subscriber_growth(ch_id)
+                if _stories_mod:
+                    try:
+                        cr["stories"] = _stories_mod.get_stories_summary(ch_id, d_from, d_to)
+                    except Exception as e:
+                        log.warning(f"Сторис {ch_id}: {e}")
+                        cr["stories"] = {"count": 0, "views": 0, "reactions": 0}
+                else:
+                    cr["stories"] = {"count": 0, "views": 0, "reactions": 0}
+
             build_summary_sheet(
                 ws_sum, results_mo,
                 f"{month_name.upper()} {d_from.year}",
                 f"Период: {d_from.strftime('%d.%m.%Y')} – {d_to.strftime('%d.%m.%Y')} | Собрано: {collect_ts}",
+            )
+            # Листы По дням и По неделям
+            build_agg_multichannel(
+                wb.create_sheet("По дням"), channels_data,
+                d_from, d_to,
+                f"📅 ПО ДНЯМ — {month_name.upper()} {d_from.year}",
+                "Каждая строка = один день. Канал за каналом. 🔴 Красным — выходные.",
+                mode="day",
+            )
+            build_agg_multichannel(
+                wb.create_sheet("По неделям"), channels_data,
+                d_from, d_to,
+                f"📆 ПО НЕДЕЛЯМ — {month_name.upper()} {d_from.year}",
+                "Каждая строка = одна неделя. Канал за каналом.",
+                mode="week",
             )
             # Переставляем листы: Сводка первой
             wb.move_sheet("Сводка", offset=-len(wb.sheetnames)+1)

@@ -110,7 +110,7 @@ def collect_msg_stats(msg) -> dict:
     forwards  = msg.forwards or 0
     votes     = extract_poll_votes(msg)
     views     = msg.views or 0
-    actions   = views + reactions + comments + forwards + votes
+    actions   = reactions + comments + forwards + votes  # без охвата
     return {
         "views": views, "reactions": reactions,
         "comments": comments, "forwards": forwards,
@@ -143,6 +143,75 @@ def save_registry(channel_username: str, data: dict):
     log.debug(f"Реестр сохранён: {path}")
 
 
+# ── Динамика подписчиков ───────────────────────────────────────────────────
+
+def subscribers_history_path(channel_username: str) -> Path:
+    ch = channel_username.lstrip("@")
+    p  = REGISTRY_DIR / ch
+    p.mkdir(parents=True, exist_ok=True)
+    return p / "subscribers_history.json"
+
+
+def load_subscribers_history(channel_username: str) -> dict:
+    path = subscribers_history_path(channel_username)
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            log.error(f"Ошибка чтения истории подписчиков {path}: {e}")
+    return {}
+
+
+def save_subscribers_history(channel_username: str, history: dict):
+    path = subscribers_history_path(channel_username)
+    path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def record_subscribers(channel_username: str, subscribers: int):
+    """
+    Записывает число подписчиков на сегодня.
+    Перезаписывает значение если уже записано сегодня (актуализация).
+    """
+    today_str = datetime.now(TZ).strftime("%Y-%m-%d")
+    history = load_subscribers_history(channel_username)
+    history[today_str] = subscribers
+    save_subscribers_history(channel_username, history)
+    log.debug(f"  [{channel_username}] Подписчики записаны: {today_str} = {subscribers}")
+
+
+def get_subscriber_growth(channel_username: str) -> dict:
+    """
+    Возвращает прирост подписчиков: сегодня, за неделю, за месяц.
+    Если данных за нужный период нет — возвращает None для этого поля.
+    """
+    history = load_subscribers_history(channel_username)
+    if not history:
+        return {"current": None, "today": None, "week": None, "month": None}
+
+    today = datetime.now(TZ).date()
+    sorted_dates = sorted(history.keys())
+    current = history.get(sorted_dates[-1]) if sorted_dates else None
+
+    def _find_value(days_ago: int):
+        target = (today - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+        # Ищем точное совпадение или ближайшую дату <= target
+        candidates = [d for d in sorted_dates if d <= target]
+        if not candidates:
+            return None
+        return history.get(candidates[-1])
+
+    yesterday_val = _find_value(1)
+    week_val      = _find_value(7)
+    month_val     = _find_value(30)
+
+    return {
+        "current": current,
+        "today":   (current - yesterday_val) if (current is not None and yesterday_val is not None) else None,
+        "week":    (current - week_val)      if (current is not None and week_val is not None) else None,
+        "month":   (current - month_val)     if (current is not None and month_val is not None) else None,
+    }
+
+
 # ── Основная логика ───────────────────────────────────────────────────────
 
 async def process_channel(client, channel_id: str):
@@ -157,6 +226,16 @@ async def process_channel(client, channel_id: str):
     username      = getattr(entity, "username", None) or str(entity.id)
     title         = getattr(entity, "title", username)
     subscribers   = getattr(entity, "participants_count", 0) or 0
+
+    # Если participants_count не вернулся — полный запрос
+    if not subscribers:
+        try:
+            from telethon.tl.functions.channels import GetFullChannelRequest
+            full = await client(GetFullChannelRequest(entity))
+            subscribers = getattr(full.full_chat, "participants_count", 0) or 0
+        except Exception as e:
+            log.warning(f"  Не удалось получить подписчиков {channel_id}: {e}")
+
     now           = now_utc()
 
     registry = load_registry(username)
@@ -165,6 +244,9 @@ async def process_channel(client, channel_id: str):
     registry["subscribers"]      = subscribers
     registry["last_checked"]     = now.isoformat()
 
+    # Записываем динамику подписчиков (раз в день — функция сама не дублирует)
+    record_subscribers(username, subscribers)
+
     posts = registry.setdefault("posts", {})
 
     # ── Шаг 1: сканируем последние посты канала (до 200 за раз) ──────────
@@ -172,12 +254,25 @@ async def process_channel(client, channel_id: str):
     cutoff = now - timedelta(hours=25)
     new_count = 0
 
+    # Сначала собираем все сообщения за 25ч
+    raw_msgs = []
+    grouped_map_snap = {}
     async for msg in client.iter_messages(entity, limit=200):
         if msg.date < cutoff:
             break
         if msg.service or not msg.id:
             continue
+        grouped_id = getattr(msg, "grouped_id", None)
+        if grouped_id:
+            grouped_map_snap.setdefault(grouped_id, []).append(msg)
+        else:
+            raw_msgs.append(msg)
 
+    # Из каждого альбома берём первое фото (min msg_id)
+    for group_msgs in grouped_map_snap.values():
+        raw_msgs.append(min(group_msgs, key=lambda m: m.id))
+
+    for msg in raw_msgs:
         msg_id = str(msg.id)
         if msg_id in posts:
             log.debug(f"  Пост {msg_id} уже в реестре")
