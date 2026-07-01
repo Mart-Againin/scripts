@@ -10,49 +10,22 @@ historical.py — модуль работы с историческими дан
 
 import json
 import logging
-import os
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 
-import pytz
-from dotenv import load_dotenv
 from telethon.tl.types import (
     MessageMediaDocument, MessageMediaPhoto, MessageMediaPoll,
     DocumentAttributeVideo, DocumentAttributeAnimated,
 )
 
-load_dotenv()
-
-REGISTRY_DIR = Path(os.getenv("REGISTRY_DIR", "registry"))
-TZ           = pytz.timezone(os.getenv("TIMEZONE", "Europe/Moscow"))
+from telegram_utils import detect_content_type, extract_poll_votes, extract_post_stats, collect_messages
+from config import REGISTRY_DIR, TZ
 
 log = logging.getLogger(__name__)
 
 
 # ── Вспомогательные функции ───────────────────────────────────────────────
 
-def _detect_content_type(msg) -> str:
-    if msg.media is None:
-        return "Текст" if msg.message else "Пустой"
-    if isinstance(msg.media, MessageMediaPoll):   return "Опрос"
-    if isinstance(msg.media, MessageMediaPhoto):  return "Фото"
-    if isinstance(msg.media, MessageMediaDocument):
-        for attr in msg.media.document.attributes:
-            if isinstance(attr, DocumentAttributeVideo):   return "Видео"
-            if isinstance(attr, DocumentAttributeAnimated): return "GIF"
-        return "Документ"
-    if getattr(msg, "web_preview", None): return "Ссылка"
-    return "Другое"
 
-
-def _extract_poll_votes(msg) -> int:
-    if not isinstance(msg.media, MessageMediaPoll): return 0
-    results = msg.media.results
-    if not results or not results.results: return 0
-    return sum(r.voters for r in results.results if r.voters)
-
-
-# ── Пути хранилища ────────────────────────────────────────────────────────
 
 def _hist_dir(channel_username: str) -> Path:
     ch = channel_username.lstrip("@")
@@ -101,21 +74,6 @@ def save_historical_month(channel_username: str, ym: str,
     }
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info(f"  [{channel_username}] Сохранено в кэш {ym}: {len(posts)} постов → {path}")
-
-
-def historical_month_exists(channel_username: str, ym: str) -> bool:
-    return _hist_path(channel_username, ym).exists()
-
-
-def get_historical_info(channel_username: str, ym: str) -> str | None:
-    """Возвращает строку с датой сбора или None."""
-    path = _hist_path(channel_username, ym)
-    if not path.exists(): return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data.get("collected_at", "")[:16].replace("T", " ")
-    except Exception:
-        return None
 
 
 # ── Сбор из Telegram ──────────────────────────────────────────────────────
@@ -207,7 +165,7 @@ async def fetch_and_cache_month(client, channel_username: str,
             reactions = sum(r.count for r in msg.reactions.results)
         comments = msg.replies.replies if msg.replies else 0
         forwards = msg.forwards or 0
-        votes    = _extract_poll_votes(msg)
+        votes    = extract_poll_votes(msg)
         views    = msg.views or 0
         # Действия = только активные действия пользователей (без охвата)
         actions  = reactions + comments + forwards + votes
@@ -220,7 +178,7 @@ async def fetch_and_cache_month(client, channel_username: str,
             "date":          pub_local.strftime("%Y-%m-%d"),
             "time":          pub_local.strftime("%H:%M"),
             "hour":          pub_local.hour,
-            "content_type":  _detect_content_type(msg),
+            "content_type":  detect_content_type(msg),
             "is_final":      True,
             "is_historical": True,
             "snapshot": {

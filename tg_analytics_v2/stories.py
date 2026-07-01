@@ -14,22 +14,15 @@ stories.py — сборщик статистики сторис (Stories) Telegr
 
 import json
 import logging
-import os
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-import pytz
-from dotenv import load_dotenv
 from telethon.tl.functions.stories import (
     GetPinnedStoriesRequest,
     GetStoriesArchiveRequest,
     GetStoriesViewsRequest,
 )
 
-load_dotenv()
-
-REGISTRY_DIR = Path(os.getenv("REGISTRY_DIR", "registry"))
-TZ           = pytz.timezone(os.getenv("TIMEZONE", "Europe/Moscow"))
+from config import REGISTRY_DIR, TZ
 
 log = logging.getLogger(__name__)
 

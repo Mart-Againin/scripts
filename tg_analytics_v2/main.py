@@ -15,41 +15,25 @@ main.py — единая точка запуска TG Analytics.
 """
 
 import asyncio
-import importlib.util
 import logging
-import os
 import sys
 from datetime import datetime, date, timedelta
-import calendar
-from pathlib import Path
 
-import pytz
-from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
 
-load_dotenv()
+from config import (
+    API_ID, API_HASH, SESSION_NAME, CHANNELS,
+    RECIPIENT_IDS, DEBUG_IDS, MODERATOR_IDS, DEBUG_MODE,
+    DAILY_REPORT_TIME as DAILY_TIME, TZ, LOGS_DIR, get_telethon_kwargs,
+)
+import report as rep
+import snapshot as snap
+import historical as hist
+import stories as stories_mod
 
-# ── Конфиг ────────────────────────────────────────────────────────────────
-API_ID       = int(os.getenv("API_ID", "0"))
-API_HASH     = os.getenv("API_HASH", "")
-SESSION_NAME = os.getenv("SESSION_NAME", "tg_analytics")
-DEBUG_MODE   = os.getenv("DEBUG", "false").lower() == "true"
-TZ           = pytz.timezone(os.getenv("TIMEZONE", "Europe/Moscow"))
-DAILY_TIME   = os.getenv("DAILY_REPORT_TIME", "12:00")
-WEEKLY_DAY   = 0   # понедельник
-MONTHLY_DAY  = 3   # 3-е число
-
-# Получатели: поддерживаем несколько через запятую
-def _parse_ids(key: str) -> list[int]:
-    raw = os.getenv(key, "")
-    return [int(x.strip()) for x in raw.split(",") if x.strip().lstrip("-").isdigit()]
-
-RECIPIENT_IDS  = _parse_ids("REPORT_RECIPIENT_ID")
-DEBUG_IDS      = _parse_ids("DEBUG_RECIPIENT_ID")
-
-LOGS_DIR = Path(os.getenv("LOGS_DIR", "logs"))
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
+WEEKLY_DAY  = 0   # понедельник
+MONTHLY_DAY = 3   # 3-е число
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG_MODE else logging.INFO,
@@ -61,23 +45,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Кто может отдавать команды — объединяем оба списка
-ALLOWED_SENDERS = set(RECIPIENT_IDS + DEBUG_IDS)
+# Кто может отдавать команды — объединяем все группы
+ALLOWED_SENDERS = set(RECIPIENT_IDS + DEBUG_IDS + MODERATOR_IDS)
 
 # Состояние диалога
 # { sender_id: {"state": "awaiting_month"|"awaiting_cache", "month_str": "06", "ym": "2026-06"} }
 _dialog_state: dict = {}
-
-
-# ── Импорт модулей ────────────────────────────────────────────────────────
-
-def _load_module(name: str):
-    spec = importlib.util.spec_from_file_location(
-        name, Path(__file__).parent / f"{name}.py"
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
 
 
 # ── Авторизация ───────────────────────────────────────────────────────────
@@ -198,24 +171,34 @@ async def run_report(client: TelegramClient, report_type: str,
                      month_override: str = None,
                      week_offset: int = 1,
                      week_date=None,
-                     force_rebuild: bool = False):
-    """Запускает генерацию отчёта. Передаёт уже открытый клиент."""
-    rep = _load_module("report")
+                     force_rebuild: bool = False,
+                     override_recipients: list = None):
+    """Запускает генерацию отчёта. Передаёт уже открытый клиент.
+    override_recipients — отправить лично конкретным людям (например,
+    модератору, запросившему отчёт по команде), минуя стандартный список."""
     await rep.build_and_send(report_type, debug_override=force_debug,
                              month_override=month_override, tg_client=client,
                              week_offset=week_offset, week_date=week_date,
-                             force_rebuild=force_rebuild)
+                             force_rebuild=force_rebuild,
+                             override_recipients=override_recipients)
+
+
+def _recipients_for_request(sender_id: int) -> list:
+    """
+    Любой отчёт, запрошенный командой в Telegram, уходит ТОЛЬКО тому,
+    кто его запросил — никогда не дублируется остальным получателям.
+    Автоматическая рассылка по расписанию эту функцию не использует.
+    """
+    return [sender_id]
 
 
 async def send_cached_report(client: TelegramClient, ym: str, sender_id: int):
     """Отправляет уже готовый файл отчёта из кэша."""
-    rep = _load_module("report")
     path = rep.get_cached_report_path(ym)
     if not path:
         await client.send_message(sender_id, "❌ Файл не найден, генерирую заново...")
         return False
-    is_debug = DEBUG_MODE
-    recipients = DEBUG_IDS if is_debug else RECIPIENT_IDS
+    recipients = _recipients_for_request(sender_id)
     for uid in recipients:
         try:
             await client.send_file(uid, str(path), caption=f"📎 {path.name}")
@@ -252,7 +235,8 @@ def register_command_handler(client: TelegramClient):
         if args == "daily":
             await event.reply("⏳ Генерирую суточный отчёт...")
             try:
-                await run_report(client, "daily", force_debug=DEBUG_MODE)
+                # Суточный по команде — лично запросившему, не по общему списку
+                await run_report(client, "daily", override_recipients=[sender_id])
             except Exception as e:
                 await event.reply(f"❌ Ошибка: {e}")
                 log.error(f"Ошибка /report daily: {e}", exc_info=DEBUG_MODE)
@@ -334,7 +318,8 @@ def register_command_handler(client: TelegramClient):
                 del _dialog_state[sender_id]
                 await event.reply("⏳ Генерирую недельный отчёт за прошлую неделю...")
                 try:
-                    await run_report(client, "weekly", force_debug=DEBUG_MODE, week_offset=1)
+                    await run_report(client, "weekly", force_debug=DEBUG_MODE, week_offset=1,
+                                     override_recipients=_recipients_for_request(sender_id))
                 except Exception as e:
                     await event.reply(f"❌ Ошибка: {e}")
 
@@ -342,7 +327,8 @@ def register_command_handler(client: TelegramClient):
                 del _dialog_state[sender_id]
                 await event.reply("⏳ Генерирую недельный отчёт за позапрошлую неделю...")
                 try:
-                    await run_report(client, "weekly", force_debug=DEBUG_MODE, week_offset=2)
+                    await run_report(client, "weekly", force_debug=DEBUG_MODE, week_offset=2,
+                                     override_recipients=_recipients_for_request(sender_id))
                 except Exception as e:
                     await event.reply(f"❌ Ошибка: {e}")
 
@@ -377,7 +363,8 @@ def register_command_handler(client: TelegramClient):
             del _dialog_state[sender_id]
             await event.reply(f"⏳ Генерирую недельный отчёт за {mon.strftime('%d.%m')}–{sun.strftime('%d.%m.%Y')}...")
             try:
-                await run_report(client, "weekly", force_debug=DEBUG_MODE, week_date=week_date)
+                await run_report(client, "weekly", force_debug=DEBUG_MODE, week_date=week_date,
+                                 override_recipients=_recipients_for_request(sender_id))
             except Exception as e:
                 await event.reply(f"❌ Ошибка: {e}")
 
@@ -394,7 +381,6 @@ def register_command_handler(client: TelegramClient):
             ym         = f"{year}-{month_str}"
             month_name = MONTH_NAMES.get(month_str, month_str)
 
-            rep         = _load_module("report")
             cached_info = rep.get_cached_report_info(ym)
 
             if cached_info:
@@ -412,7 +398,8 @@ def register_command_handler(client: TelegramClient):
                 del _dialog_state[sender_id]
                 await event.reply(f"⏳ Генерирую месячный отчёт за {month_name} {year}...")
                 try:
-                    await run_report(client, "monthly", force_debug=DEBUG_MODE, month_override=ym)
+                    await run_report(client, "monthly", force_debug=DEBUG_MODE, month_override=ym,
+                                     override_recipients=_recipients_for_request(sender_id))
                 except Exception as e:
                     await event.reply(f"❌ Ошибка: {e}")
 
@@ -429,7 +416,8 @@ def register_command_handler(client: TelegramClient):
                 if not ok:
                     await event.reply("⏳ Файл не найден, генерирую заново...")
                     try:
-                        await run_report(client, "monthly", force_debug=DEBUG_MODE, month_override=ym)
+                        await run_report(client, "monthly", force_debug=DEBUG_MODE, month_override=ym,
+                                         override_recipients=_recipients_for_request(sender_id))
                     except Exception as e:
                         await event.reply(f"❌ Ошибка: {e}")
             elif text == "2":
@@ -437,7 +425,8 @@ def register_command_handler(client: TelegramClient):
                 await event.reply(f"⏳ Пересчитываю отчёт за {month_name} {year} (кэш сбрасывается)...")
                 try:
                     await run_report(client, "monthly", force_debug=DEBUG_MODE,
-                                     month_override=ym, force_rebuild=True)
+                                     month_override=ym, force_rebuild=True,
+                                     override_recipients=_recipients_for_request(sender_id))
                 except Exception as e:
                     await event.reply(f"❌ Ошибка: {e}")
             else:
@@ -462,13 +451,11 @@ def register_command_handler(client: TelegramClient):
                 year = datetime.now(TZ).year
                 await event.reply(f"⏳ Запускаю ретро-сбор с января по текущий месяц {year}...")
                 try:
-                    hist = _load_module("historical")
-                    channels = [c.strip() for c in os.getenv("CHANNELS","").split(",") if c.strip()]
                     cur_month = datetime.now(TZ).month
                     for mo in range(1, cur_month):
                         ym = f"{year}-{mo:02d}"
                         await event.reply(f"  Собираю {ym}...")
-                        for ch in channels:
+                        for ch in CHANNELS:
                             await hist.fetch_and_cache_month(client, ch, ym, force=False)
                     await event.reply(f"✅ Ретро-сбор завершён. Данные за {year} доступны.")
                 except Exception as e:
@@ -490,9 +477,7 @@ def register_command_handler(client: TelegramClient):
             del _dialog_state[sender_id]
             await event.reply(f"⏳ Ретро-сбор за {month_name} {year}...")
             try:
-                hist     = _load_module("historical")
-                channels = [c.strip() for c in os.getenv("CHANNELS","").split(",") if c.strip()]
-                for ch in channels:
+                for ch in CHANNELS:
                     await hist.fetch_and_cache_month(client, ch, ym, force=False)
                 await event.reply(f"✅ Данные за {month_name} {year} сохранены в кэш.")
             except Exception as e:
@@ -517,8 +502,6 @@ def register_command_handler(client: TelegramClient):
             del _dialog_state[sender_id]
             await event.reply(f"⏳ Ретро-сбор за {mon.strftime('%d.%m')}–{sun.strftime('%d.%m.%Y')}...")
             try:
-                hist     = _load_module("historical")
-                channels = [c.strip() for c in os.getenv("CHANNELS","").split(",") if c.strip()]
                 # Неделя может захватить два месяца
                 months = set()
                 d = mon
@@ -526,7 +509,7 @@ def register_command_handler(client: TelegramClient):
                     months.add(d.strftime("%Y-%m"))
                     d += _td(days=1)
                 for ym in sorted(months):
-                    for ch in channels:
+                    for ch in CHANNELS:
                         await hist.fetch_and_cache_month(client, ch, ym, force=False)
                 await event.reply(f"✅ Данные за {mon.strftime('%d.%m')}–{sun.strftime('%d.%m.%Y')} сохранены.")
             except Exception as e:
@@ -570,18 +553,14 @@ async def tick(client: TelegramClient):
     if _last_snapshot is None or (now - _last_snapshot).total_seconds() >= 3600:
         log.info("▶ Запуск сборщика...")
         try:
-            snap = _load_module("snapshot")
-            channels = [c.strip() for c in os.getenv("CHANNELS","").split(",") if c.strip()]
-            for ch in channels:
+            for ch in CHANNELS:
                 await snap.process_channel(client, ch)
             log.info("✓ Сборщик постов завершён")
         except Exception as e:
             log.error(f"Ошибка сборщика постов: {e}", exc_info=DEBUG_MODE)
 
         try:
-            stories_mod = _load_module("stories")
-            channels = [c.strip() for c in os.getenv("CHANNELS","").split(",") if c.strip()]
-            for ch in channels:
+            for ch in CHANNELS:
                 await stories_mod.process_channel_stories(client, ch)
             log.info("✓ Сборщик сторис завершён")
         except Exception as e:
@@ -633,7 +612,7 @@ async def main():
         input("  Нажмите Enter для выхода...")
         sys.exit(1)
 
-    channels = [c.strip() for c in os.getenv("CHANNELS","").split(",") if c.strip()]
+    channels = CHANNELS
     if not channels:
         print()
         print("  ❌ Не указаны каналы в .env (параметр CHANNELS).")
@@ -641,33 +620,25 @@ async def main():
         input("  Нажмите Enter для выхода...")
         sys.exit(1)
 
-    proxy_cfg = None
-    if os.getenv("PROXY_TYPE"):
-        import socks
-        _pt = {"socks5": socks.SOCKS5, "socks4": socks.SOCKS4, "http": socks.HTTP}
-        proxy_cfg = (
-            _pt.get(os.getenv("PROXY_TYPE","socks5").lower(), socks.SOCKS5),
-            os.getenv("PROXY_HOST"), int(os.getenv("PROXY_PORT","1080")),
-            True,
-            os.getenv("PROXY_USERNAME") or None,
-            os.getenv("PROXY_PASSWORD") or None,
-        )
-
-    kwargs = {"proxy": proxy_cfg} if proxy_cfg else {}
+    kwargs = get_telethon_kwargs()
 
     recipients_display = ", ".join(str(i) for i in (DEBUG_IDS if DEBUG_MODE else RECIPIENT_IDS))
 
     print()
     print("╔══════════════════════════════════════════════════╗")
     print("║           TG Analytics — запуск                 ║")
-    print(f"║  Каналы:      {', '.join(channels)[:34]:<34}║")
+    print(f"║  Каналы:      {', '.join(CHANNELS)[:34]:<34}║")
     print(f"║  Режим:       {'DEBUG (тестовый)' if DEBUG_MODE else 'Рабочий':<34}║")
     print(f"║  Получатели:  {recipients_display[:34]:<34}║")
-    print(f"║  Часовой пояс: {os.getenv('TIMEZONE','Europe/Moscow'):<33}║")
+    if MODERATOR_IDS:
+        mod_display = ", ".join(str(i) for i in MODERATOR_IDS)
+        print(f"║  Модераторы:  {mod_display[:34]:<34}║")
+    from config import TIMEZONE_NAME
+    print(f"║  Часовой пояс: {TIMEZONE_NAME:<33}║")
     print("╚══════════════════════════════════════════════════╝")
     print()
     print("  Команды (писать в Telegram этому аккаунту или получателю):")
-    print("  /report daily   — суточный отчёт прямо сейчас")
+    print("  /report daily   — суточный отчёт прямо сейчас (лично вам)")
     print("  /report weekly  — недельный отчёт прямо сейчас")
     print("  /report monthly — месячный отчёт (спросит период)")
     print()
@@ -685,6 +656,8 @@ async def main():
             log.info(f"DEBUG: суточный отчёт в {DAILY_TIME} МСК → {DEBUG_IDS}")
         if RECIPIENT_IDS:
             log.info(f"Получатели отчётов: {RECIPIENT_IDS}")
+        if MODERATOR_IDS:
+            log.info(f"Модераторы (доступ по команде, без авторассылки): {MODERATOR_IDS}")
 
         while True:
             try:

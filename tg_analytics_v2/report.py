@@ -27,62 +27,24 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import sys
 from calendar import monthrange
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-import pytz
-from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.chart import BarChart, LineChart, Reference
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from telethon import TelegramClient
 
-load_dotenv()
-
-# ── Конфиг ────────────────────────────────────────────────────────────────
-API_ID        = int(os.getenv("API_ID", "0"))
-API_HASH      = os.getenv("API_HASH", "")
-SESSION_NAME  = os.getenv("SESSION_NAME", "tg_analytics")
-CHANNELS_RAW  = os.getenv("CHANNELS", "")
-
-def _parse_ids(key):
-    raw = os.getenv(key, "")
-    return [int(x.strip()) for x in raw.split(",") if x.strip().lstrip("-").isdigit()]
-
-RECIPIENT_IDS = _parse_ids("REPORT_RECIPIENT_ID")
-DEBUG_MODE    = os.getenv("DEBUG", "false").lower() == "true"
-DEBUG_IDS     = _parse_ids("DEBUG_RECIPIENT_ID")
-OUTPUT_DIR    = Path(os.getenv("OUTPUT_DIR", "output"))
-REGISTRY_DIR  = Path(os.getenv("REGISTRY_DIR", "registry"))
-ARCHIVE_DIR   = Path(os.getenv("ARCHIVE_DIR", "archive"))
-LOGS_DIR      = Path(os.getenv("LOGS_DIR", "logs"))
-TZ            = pytz.timezone(os.getenv("TIMEZONE", "Europe/Moscow"))
-
-CQI_W = {
-    "react":   int(os.getenv("CQI_W_REACT",   "1")),
-    "vote":    int(os.getenv("CQI_W_VOTE",     "2")),
-    "forward": int(os.getenv("CQI_W_FORWARD",  "4")),
-    "comment": int(os.getenv("CQI_W_COMMENT",  "5")),
-}
-
-PROXY_CFG = None
-if os.getenv("PROXY_TYPE"):
-    import socks
-    _pt = {"socks5": socks.SOCKS5, "socks4": socks.SOCKS4, "http": socks.HTTP}
-    PROXY_CFG = (
-        _pt.get(os.getenv("PROXY_TYPE","socks5").lower(), socks.SOCKS5),
-        os.getenv("PROXY_HOST"), int(os.getenv("PROXY_PORT","1080")),
-        True, os.getenv("PROXY_USERNAME") or None, os.getenv("PROXY_PASSWORD") or None,
-    )
-
-for d in [OUTPUT_DIR/"daily", OUTPUT_DIR/"weekly", OUTPUT_DIR/"monthly",
-          ARCHIVE_DIR, LOGS_DIR]:
-    d.mkdir(parents=True, exist_ok=True)
+from config import (
+    API_ID, API_HASH, SESSION_NAME, CHANNELS,
+    RECIPIENT_IDS, DEBUG_IDS, DEBUG_MODE,
+    OUTPUT_DIR, REGISTRY_DIR, ARCHIVE_DIR, LOGS_DIR,
+    TZ, CQI_W, get_telethon_kwargs,
+)
 
 logging.basicConfig(
     level=logging.DEBUG if DEBUG_MODE else logging.INFO,
@@ -272,8 +234,14 @@ async def get_channel_posts(client, channel_username: str,
                              force_historical: bool = False) -> tuple[list, int, bool]:
     """
     Возвращает (posts, subscribers, is_historical).
-    Сначала ищет 24ч срезы в реестре.
-    Если нет — обращается к historical.py (кэш → Telegram).
+
+    Приоритет данных:
+      1. 24ч-срезы из registry.json — если они есть, используются ВСЕГДА,
+         независимо от force_historical. Это честные данные, собранные
+         самим скриптом, их нельзя терять при пересчёте.
+      2. Если 24ч-срезов нет — берём исторические данные.
+         force_historical=True здесь означает «сбросить кэш historical/
+         и перечитать из Telegram заново» (см. historical.py).
     """
     import historical as hist_mod
 
@@ -281,10 +249,11 @@ async def get_channel_posts(client, channel_username: str,
     subscribers = registry.get("subscribers", 0) if registry else 0
     posts_24h   = posts_for_period(registry, date_from, date_to) if registry else []
 
-    if posts_24h and not force_historical:
+    if posts_24h:
+        # 24ч-срезы есть — используем их в любом случае, это приоритетные данные
         return posts_24h, subscribers, False
 
-    # Нет 24ч срезов — берём исторические
+    # 24ч-срезов нет — берём исторические (с принудительным пересбором если попросили)
     posts, subs = await hist_mod.get_posts_for_period(
         client, channel_username, date_from, date_to, force=force_historical)
     if subs: subscribers = subs
@@ -429,8 +398,7 @@ def build_multichannel_posts_sheet(ws, channels_data: list,
 
 # ── Сводный лист ──────────────────────────────────────────────────────────
 SUMMARY_COLS = [
-    ("Канал",              22), ("Подписчики",      13),
-    ("+сегодня",           10), ("+неделя",          10), ("+месяц",           10),
+    ("Канал",              22), ("Подписчики",      13), ("+месяц",           10),
     ("Постов",             10), ("Сторис",           10),
     ("Охват постов",       14), ("Охват сторис",     14), ("Общий охват",      14),
     ("Реакции (сумм.)",    13), ("Комменты (сумм.)", 13),
@@ -441,8 +409,8 @@ SUMMARY_COLS = [
     ("Лучший пост (CQI)",  28), ("Данные",           16),
 ]
 # Индексы под новую раскладку (считая с 1)
-PCT_SUM   = {16,17,18,19,20}
-FLOAT_SUM = {21,22}
+PCT_SUM   = {14,15,16,17,18}
+FLOAT_SUM = {19,20}
 
 def build_summary_sheet(ws, results: list, label: str, subtitle: str):
     n = len(SUMMARY_COLS)
@@ -452,7 +420,7 @@ def build_summary_sheet(ws, results: list, label: str, subtitle: str):
         ws.column_dimensions[get_column_letter(i)].width = width
     ws.row_dimensions[hdr_row].height = 30
 
-    GROWTH_COLS = {3, 4, 5}  # +сегодня, +неделя, +месяц — могут быть отрицательными
+    GROWTH_COL = 3  # +месяц — может быть отрицательным
 
     for idx, cr in enumerate(results):
         r       = hdr_row + 1 + idx
@@ -470,8 +438,7 @@ def build_summary_sheet(ws, results: list, label: str, subtitle: str):
         views_total  = views_posts + views_stories
 
         row_v = [
-            cr["channel_id"], cr["subscribers"],
-            growth.get("today"), growth.get("week"), growth.get("month"),
+            cr["channel_id"], cr["subscribers"], growth.get("month"),
             cr["count"], stories_data.get("count", 0),
             views_posts, views_stories, views_total,
             t.get("reactions"), t.get("comments"),
@@ -488,7 +455,7 @@ def build_summary_sheet(ws, results: list, label: str, subtitle: str):
             cell.alignment = _align(h="left" if i==1 else "center")
             if v is None:
                 cell.value = "—"
-            elif i in GROWTH_COLS:
+            elif i == GROWTH_COL:
                 cell.value = f"+{v}" if v > 0 else str(v)
                 cell.font  = _f(sz=10, bold=True,
                                 color="2E7D32" if v > 0 else ("C62828" if v < 0 else "666666"))
@@ -496,7 +463,7 @@ def build_summary_sheet(ws, results: list, label: str, subtitle: str):
                 fv(cell, v, pct=True)
             elif i in FLOAT_SUM:
                 fv(cell, v, flt=True)
-            elif i in {2,6,7,8,9,10,11,12,13,14,15}:
+            elif i in {2,4,5,6,7,8,9,10,11,12,13}:
                 fv(cell, v)
             else:
                 cell.value = v
@@ -510,8 +477,7 @@ def build_summary_sheet(ws, results: list, label: str, subtitle: str):
     ws[f"A{rt}"].alignment = _align()
     ws[f"A{rt}"].border    = _b()
 
-    SUM_COLS = {6,7,8,9,10,11,12,13,14}
-    keys = ["","","","","","count","_stories_count","_views_posts","_views_stories","_views_total",
+    keys = ["","","","count","_stories_count","_views_posts","_views_stories","_views_total",
             "reactions","comments","forwards","votes","actions",
             "err","er","vrpost","vf","reply","rm","cqi"]
     for j in range(3, n+1):
@@ -520,7 +486,7 @@ def build_summary_sheet(ws, results: list, label: str, subtitle: str):
         cell.border = _b(); cell.alignment = _align()
         key = keys[j-1] if j-1 < len(keys) else ""
 
-        if j in GROWTH_COLS:
+        if j == GROWTH_COL:
             cell.value = "—"
         elif key == "count":
             fv(cell, sum(cr["count"] for cr in results))
@@ -548,7 +514,7 @@ def build_summary_sheet(ws, results: list, label: str, subtitle: str):
     # Пометка о динамике подписчиков
     rn = rt + 2
     ws.merge_cells(f"A{rn}:{get_column_letter(n)}{rn}")
-    ws[f"A{rn}"].value = ("ℹ️  Колонки «+сегодня / +неделя / +месяц» показывают прирост подписчиков. "
+    ws[f"A{rn}"].value = ("ℹ️  Колонка «+месяц» показывает прирост подписчиков с прошлой месячной записи. "
         "Данные накапливаются с момента запуска скрипта — если истории меньше нужного периода, ячейка будет «—».")
     ws[f"A{rn}"].font      = _f(sz=9, italic=True, color="595959")
     ws[f"A{rn}"].alignment = _align(h="left")
@@ -672,6 +638,8 @@ def build_agg_multichannel(ws, channels_data: list,
         for p in posts:
             by_date.setdefault(p.get("date",""), []).append(p)
 
+        data_start_row = cur  # первая строка с данными — нужна для графика
+
         if mode == "day":
             # Итерируем по дням периода
             d = date_from
@@ -701,6 +669,8 @@ def build_agg_multichannel(ws, channels_data: list,
                 _agg_bucket_row(ws, cur, label, "", wp, subs, bg, "week")
                 cur += 1; week_start += timedelta(days=7); idx += 1
 
+        data_end_row = cur - 1  # последняя строка с данными (перед "Итого")
+
         # Итого по каналу
         ws.merge_cells(f"A{cur}:{last_col}{cur}")
         ws[f"A{cur}"].value     = f"Итого {ch_id}"
@@ -714,6 +684,46 @@ def build_agg_multichannel(ws, channels_data: list,
         ws.row_dimensions[cur].height = 20
         cur += 2  # итого + пустая строка
 
+        # Графики по каналу: охват по периодам + ERR по периодам
+        if data_end_row >= data_start_row:
+            views_col = 4 if mode == "day" else 3
+            err_col   = 11 if mode == "day" else 9
+            cat_col   = 1  # столбец с датой/неделей — категории для оси X
+
+            cats_ref = Reference(ws, min_col=cat_col, min_row=data_start_row, max_row=data_end_row)
+
+            chart_views = BarChart()
+            chart_views.type = "col"
+            chart_views.title = f"{ch_id} — охват по периодам"
+            chart_views.y_axis.title = "Просмотры"
+            chart_views.height = 7
+            chart_views.width = 16
+            views_ref = Reference(ws, min_col=views_col, min_row=hdr_row, max_row=data_end_row)
+            chart_views.add_data(views_ref, titles_from_data=True)
+            chart_views.set_categories(cats_ref)
+            if chart_views.series:
+                chart_views.series[0].graphicalProperties.solidFill = C["mid"]
+            chart_views.legend = None
+            ws.add_chart(chart_views, f"A{cur}")
+
+            chart_err = LineChart()
+            chart_err.title = f"{ch_id} — ERR (%) по периодам"
+            chart_err.y_axis.title = "ERR %"
+            chart_err.height = 7
+            chart_err.width = 16
+            err_ref = Reference(ws, min_col=err_col, min_row=hdr_row, max_row=data_end_row)
+            chart_err.add_data(err_ref, titles_from_data=True)
+            chart_err.set_categories(cats_ref)
+            if chart_err.series:
+                chart_err.series[0].graphicalProperties.line.solidFill = C["orange"]
+            chart_err.legend = None
+            # Графики ставим бок о бок (примерно 8 колонок ширина бар-чарта в Excel-единицах)
+            anchor_col = get_column_letter(n + 2)
+            ws.add_chart(chart_err, f"{anchor_col}{cur}")
+
+            # Резервируем строки под высоту графиков (примерно 14-15 строк на каждый)
+            cur += 16
+
     # Заметка о выходных (только для дневного)
     if mode == "day":
         ws.merge_cells(f"A{cur}:{last_col}{cur}")
@@ -722,10 +732,101 @@ def build_agg_multichannel(ws, channels_data: list,
         ws[f"A{cur}"].alignment = _align(h="left")
         ws.row_dimensions[cur].height = 14
 
+
+# ── Лист «Календарь» (только для месячного отчёта) ────────────────────────
+
+WEEKDAY_LABELS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+
+def build_calendar_sheet(ws, channels_data: list,
+                          date_from: date, date_to: date,
+                          title: str, subtitle: str):
+    """
+    Календарная сетка по месяцу: строки = недели (1-5), столбцы = дни недели (Пн-Вс).
+    Один календарь на канал, каналы идут друг за другом сверху вниз.
+    В ячейке дня — количество постов или «—» если дня нет в периоде/постов не было.
+    Дни вне месяца (до 1-го числа или после последнего) помечаются отдельным цветом.
+    """
+    n = 7  # 7 дней недели
+    hdr_row = title_block(ws, title, subtitle, n)
+
+    for i, label in enumerate(WEEKDAY_LABELS, 1):
+        hdr(ws[f"{get_column_letter(i)}{hdr_row}"], label, bg=C["mid"])
+        ws.column_dimensions[get_column_letter(i)].width = 13
+    ws.row_dimensions[hdr_row].height = 24
+
+    # Группируем посты по дате для быстрого доступа
+    cur = hdr_row + 1
+    last_col = get_column_letter(n)
+
+    # Первая и последняя неделя месяца (пн-вс), чтобы знать сколько строк-недель нужно
+    grid_start = date_from - timedelta(days=date_from.weekday())          # понедельник первой недели
+    grid_end   = date_to + timedelta(days=(6 - date_to.weekday()))        # воскресенье последней недели
+    n_weeks = (grid_end - grid_start).days // 7 + 1
+
+    for cd in channels_data:
+        ch_id   = cd["channel_id"]
+        subs    = cd["subscribers"]
+        posts   = cd["posts"]
+        is_hist = cd.get("is_historical", False)
+
+        by_date = {}
+        for p in posts:
+            by_date.setdefault(p.get("date", ""), []).append(p)
+
+        # Заголовок канала
+        _channel_divider(ws, cur, ch_id, subs, is_hist)
+        cur += 1
+
+        # Сетка недель
+        week_start = grid_start
+        for w in range(n_weeks):
+            for d_idx in range(7):
+                day = week_start + timedelta(days=d_idx)
+                col = d_idx + 1
+                cell_ref = ws.cell(row=cur, column=col)
+                cell_ref.border = _b()
+                cell_ref.alignment = _align()
+
+                in_month = date_from <= day <= date_to
+                if not in_month:
+                    # День вне диапазона месяца — серая ячейка с прочерком
+                    cell_ref.value = "—"
+                    cell_ref.fill = _fill("EDEDED")
+                    cell_ref.font = _f(sz=9, color="B0B0B0", italic=True)
+                else:
+                    ds = day.strftime("%Y-%m-%d")
+                    day_posts = by_date.get(ds, [])
+                    is_weekend = d_idx >= 5
+                    count = len(day_posts)
+
+                    if count == 0:
+                        cell_ref.value = f"{day.day}\n—"
+                        cell_ref.fill = _fill(C["red"] if is_weekend else C["white"])
+                        cell_ref.font = _f(sz=10, color="999999")
+                    else:
+                        cell_ref.value = f"{day.day}\n{count} пост." if count != 1 else f"{day.day}\n1 пост"
+                        cell_ref.fill = _fill(C["green"] if not is_weekend else C["red"])
+                        cell_ref.font = _f(sz=10, bold=True)
+            ws.row_dimensions[cur].height = 32
+            cur += 1
+            week_start += timedelta(days=7)
+
+        # Лёгкая разделительная строка между календарями каналов
+        cur += 1
+
+    # Легенда
+    ws.merge_cells(f"A{cur}:{last_col}{cur}")
+    ws[f"A{cur}"].value = ("Серым — дни вне месяца. Зелёным — дни с постами. "
+                            "Белым/красным (выходные) — дни без публикаций.")
+    ws[f"A{cur}"].font = _f(sz=9, italic=True, color="595959")
+    ws[f"A{cur}"].alignment = _align(h="left")
+    ws.row_dimensions[cur].height = 18
+    ws.sheet_view.showGridLines = False
+
 # ── Лист пояснений ────────────────────────────────────────────────────────
 LEGEND = [
-    ("+сегодня / +неделя / +месяц", "Прирост = подписчики сегодня − подписчики N дней назад",
-     "Динамика подписчиков. Накапливается с момента запуска скрипта — если истории меньше нужного периода, будет «—»", "Базовые данные"),
+    ("+месяц", "Подписчики этот месяц − подписчики прошлый месяц",
+     "Динамика подписчиков. Фиксируется раз в месяц (в начале месяца). Накапливается с момента запуска скрипта — если данных меньше двух месяцев, будет «—»", "Базовые данные"),
     ("Сторис",                "Telegram API: stories.GetPinnedStories / GetStoriesArchive",
      "Количество сторис опубликованных каналом за период. Учитываются только сторис, отслеженные скриптом (с момента запуска)", "Базовые данные"),
     ("Охват постов",          "Сумма Views по всем постам периода",
@@ -855,10 +956,14 @@ def determine_period(report_type: str,
 async def build_and_send(report_type: str, debug_override: bool = False,
                          month_override: str = None, tg_client=None,
                          week_offset: int = 1, week_date: date = None,
-                         force_rebuild: bool = False):
+                         force_rebuild: bool = False,
+                         override_recipients: list = None):
     is_debug   = DEBUG_MODE or debug_override
-    recipients = DEBUG_IDS if is_debug else RECIPIENT_IDS
-    channels   = [c.strip() for c in CHANNELS_RAW.split(",") if c.strip()]
+    # override_recipients — точечная отправка конкретному человеку
+    # (например, модератор запросил суточный отчёт лично себе)
+    recipients = override_recipients if override_recipients is not None else (
+        DEBUG_IDS if is_debug else RECIPIENT_IDS)
+    channels   = CHANNELS
     collect_ts = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
 
     if month_override and report_type == "monthly":
@@ -907,17 +1012,10 @@ async def build_and_send(report_type: str, debug_override: bool = False,
             )
             # Сводку строим из results_mo
             # Подмешиваем данные о приросте подписчиков и сторис
-            import importlib.util as _ilu
-            _snap_spec = _ilu.spec_from_file_location(
-                "snapshot", Path(__file__).parent / "snapshot.py")
-            _snap_mod = _ilu.module_from_spec(_snap_spec)
-            _snap_spec.loader.exec_module(_snap_mod)
+            import snapshot as _snap_mod
 
             try:
-                _stories_spec = _ilu.spec_from_file_location(
-                    "stories", Path(__file__).parent / "stories.py")
-                _stories_mod = _ilu.module_from_spec(_stories_spec)
-                _stories_spec.loader.exec_module(_stories_mod)
+                import stories as _stories_mod
             except Exception as e:
                 log.warning(f"Модуль stories.py недоступен: {e}")
                 _stories_mod = None
@@ -953,6 +1051,13 @@ async def build_and_send(report_type: str, debug_override: bool = False,
                 f"📆 ПО НЕДЕЛЯМ — {month_name.upper()} {d_from.year}",
                 "Каждая строка = одна неделя. Канал за каналом.",
                 mode="week",
+            )
+            # Лист «Календарь» — наглядная сетка по дням месяца, канал за каналом
+            build_calendar_sheet(
+                wb.create_sheet("Календарь"), channels_data,
+                d_from, d_to,
+                f"🗓️ КАЛЕНДАРЬ ПУБЛИКАЦИЙ — {month_name.upper()} {d_from.year}",
+                "Недели по вертикали, дни недели по горизонтали. Число — количество постов за день.",
             )
             # Переставляем листы: Сводка первой
             wb.move_sheet("Сводка", offset=-len(wb.sheetnames)+1)
@@ -998,7 +1103,7 @@ async def build_and_send(report_type: str, debug_override: bool = False,
     if tg_client is not None:
         files = await _execute(tg_client)
     else:
-        _kw = {"proxy": PROXY_CFG} if PROXY_CFG else {}
+        _kw = get_telethon_kwargs()
         async with TelegramClient(SESSION_NAME, API_ID, API_HASH, **_kw) as _c:
             files = await _execute(_c)
 
