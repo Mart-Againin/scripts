@@ -231,58 +231,88 @@ def get_cached_report_info(ym: str) -> str | None:
 # ── Получение данных с учётом исторического кэша ─────────────────────────
 async def get_channel_posts(client, channel_username: str,
                              date_from: date, date_to: date,
-                             force_historical: bool = False) -> tuple[list, int, bool]:
+                             force_historical: bool = False) -> tuple[list, int]:
     """
-    Возвращает (posts, subscribers, is_historical).
+    Возвращает (posts, subscribers).
 
-    Приоритет данных:
-      1. 24ч-срезы из registry.json — если они есть, используются ВСЕГДА,
-         независимо от force_historical. Это честные данные, собранные
-         самим скриптом, их нельзя терять при пересчёте.
-      2. Если 24ч-срезов нет — берём исторические данные.
-         force_historical=True здесь означает «сбросить кэш historical/
-         и перечитать из Telegram заново» (см. historical.py).
+    Логика сборки данных:
+      1. Запрашиваем исторические данные из Telegram за весь период
+         (текущая статистика на момент запроса — для всех постов)
+      2. Поверх накладываем финальные 24ч-срезы из реестра/архива
+         (константа, не перезаписывается)
+
+    Итог: 100% постов имеют данные.
+    Пометка в поле "_note":
+      "✅ 24ч"  — зафиксированный 24-часовой срез
+      "📸 тек." — текущая статистика на момент отчёта
     """
     import historical as hist_mod
+    from registry_manager import get_final_posts_for_period
 
-    registry    = load_registry(channel_username)
-    subscribers = registry.get("subscribers", 0) if registry else 0
-    posts_24h   = posts_for_period(registry, date_from, date_to) if registry else []
-
-    if posts_24h:
-        # 24ч-срезы есть — используем их в любом случае, это приоритетные данные
-        return posts_24h, subscribers, False
-
-    # 24ч-срезов нет — берём исторические (с принудительным пересбором если попросили)
-    posts, subs = await hist_mod.get_posts_for_period(
+    # Шаг 1: исторические данные из Telegram (база — все посты периода)
+    hist_posts, subscribers = await hist_mod.get_posts_for_period(
         client, channel_username, date_from, date_to, force=force_historical)
-    if subs: subscribers = subs
-    return posts, subscribers, True
+
+    # Индексируем по msg_id для быстрого доступа
+    posts_by_id: dict = {}
+    for p in hist_posts:
+        p["_note"]        = "📸 тек."
+        p["is_historical"] = True
+        posts_by_id[str(p["msg_id"])] = p
+
+    # Шаг 2: накладываем финальные 24ч-срезы поверх исторических
+    final_posts = get_final_posts_for_period(channel_username, date_from, date_to)
+    replaced = 0
+    for mid, fp in final_posts.items():
+        if mid in posts_by_id:
+            # Заменяем snapshot на зафиксированный 24ч срез
+            posts_by_id[mid]["snapshot"]     = fp["snapshot"]
+            posts_by_id[mid]["_note"]        = "✅ 24ч"
+            posts_by_id[mid]["is_historical"] = False
+            replaced += 1
+        else:
+            # Пост есть в реестре, но не нашёлся через исторический API
+            # (например удалён из канала) — добавляем напрямую
+            fp["_note"]        = "✅ 24ч"
+            fp["is_historical"] = False
+            posts_by_id[mid] = fp
+
+    if replaced:
+        log.info(f"  [{channel_username}] 24ч срезов наложено: {replaced}/{len(posts_by_id)}")
+
+    # Если subscribers не вернулся из исторического — берём из реестра
+    if not subscribers:
+        from registry_manager import load_registry
+        reg = load_registry(channel_username)
+        subscribers = reg.get("subscribers", 0)
+
+    posts = sorted(posts_by_id.values(),
+                   key=lambda x: (x.get("date",""), x.get("time","")))
+    return posts, subscribers
 
 # ── Построение листа с постами всех каналов ──────────────────────────────
-def _channel_divider(ws, row: int, ch_id: str, subs: int, is_hist: bool):
+def _channel_divider(ws, row: int, ch_id: str, subs: int, is_hist: bool = False):
     last = get_column_letter(N_COLS)
     ws.merge_cells(f"A{row}:{last}{row}")
-    hist_note = " │ 📜 исторические данные (статистика на дату запроса)" if is_hist else ""
-    ws[f"A{row}"].value     = f"── {ch_id}  ({subs:,} подписчиков){hist_note}"
+    ws[f"A{row}"].value     = f"── {ch_id}  ({subs:,} подписчиков)"
     ws[f"A{row}"].font      = _f(bold=True, sz=11, color=C["white"])
     ws[f"A{row}"].fill      = _fill(C["dark"])
     ws[f"A{row}"].alignment = _align(h="left")
     ws.row_dimensions[row].height = 22
 
 def _write_post_row(ws, r: int, p: dict, subscribers: int, bg: str):
-    sn      = p.get("snapshot", {})
+    sn      = p.get("snapshot", {}) or {}
     m       = calc(sn, subscribers)
-    is_hist = p.get("is_historical", False)
+    note    = p.get("_note", "")
     SNAP    = {"views","reactions","comments","forwards","votes","actions"}
     for i, (_, key, _, is_pct, is_flt) in enumerate(POST_COLS, 1):
         cell = ws.cell(row=r, column=i)
-        cell.fill      = _fill(C["hist"] if is_hist else bg)
-        cell.font      = _f(sz=10, italic=is_hist)
+        cell.fill      = _fill(bg)
+        cell.font      = _f(sz=10)
         cell.border    = _b()
         cell.alignment = _align(h="left" if i <= 4 else "center")
         if key == "_note":
-            cell.value = "📜 ист." if is_hist else ""
+            cell.value = note
         elif key in SNAP:
             fv(cell, sn.get(key), pct=is_pct, flt=is_flt)
         elif key in p:
@@ -385,14 +415,7 @@ def build_multichannel_posts_sheet(ws, channels_data: list,
                          "totals": totals, "avgs": avgs, "best": best,
                          "count": len(posts)})
 
-    if any(r.get("is_historical") for r in results):
-        ws.merge_cells(f"A{cur}:{last_col}{cur}")
-        ws[f"A{cur}"].value = ("📜 Жёлтый фон = исторические данные. "
-            "Статистика на момент запроса, а не через 24 ч после публикации.")
-        ws[f"A{cur}"].font      = _f(sz=9, italic=True, color="7D6608")
-        ws[f"A{cur}"].fill      = _fill(C["hist"])
-        ws[f"A{cur}"].alignment = _align(h="left")
-        ws.row_dimensions[cur].height = 18
+
 
     return results
 
@@ -429,7 +452,10 @@ def build_summary_sheet(ws, results: list, label: str, subtitle: str):
         tf      = Counter(p.get("content_type","") for p in cr["posts"]).most_common(1)
         top_fmt = tf[0][0] if tf else "—"
         best_url= cr["best"]["url"] if cr.get("best") else "—"
-        dtype   = "📜 Исторические" if cr.get("is_historical") else "✅ 24ч срезы"
+        # Считаем долю постов с 24ч данными
+        n_final = sum(1 for p in cr["posts"] if p.get("_note") == "✅ 24ч")
+        n_total = len(cr["posts"])
+        dtype   = f"✅ {n_final}/{n_total} постов с 24ч данными" if n_final else "📸 тек. статистика"
 
         growth       = cr.get("growth", {})
         stories_data = cr.get("stories", {})
@@ -717,11 +743,10 @@ def build_agg_multichannel(ws, channels_data: list,
             if chart_err.series:
                 chart_err.series[0].graphicalProperties.line.solidFill = C["orange"]
             chart_err.legend = None
-            # Графики ставим бок о бок (примерно 8 колонок ширина бар-чарта в Excel-единицах)
-            anchor_col = get_column_letter(n + 2)
-            ws.add_chart(chart_err, f"{anchor_col}{cur}")
+            # ERR-график правее через 2 столбца от охвата (J = 10-й столбец, фиксировано)
+            ws.add_chart(chart_err, f"J{cur}")
 
-            # Резервируем строки под высоту графиков (примерно 14-15 строк на каждый)
+            # Резервируем строки под высоту одного ряда графиков
             cur += 16
 
     # Заметка о выходных (только для дневного)
@@ -986,13 +1011,12 @@ async def build_and_send(report_type: str, debug_override: bool = False,
     async def _execute(client):
         channels_data = []
         for ch in channels:
-            posts, subs, is_hist = await get_channel_posts(
+            posts, subs = await get_channel_posts(
                 client, ch, d_from, d_to, force_historical=force_rebuild)
             channels_data.append({
                 "channel_id":   ch,
                 "subscribers":  subs,
                 "posts":        posts,
-                "is_historical": is_hist,
             })
 
         wb = Workbook(); wb.remove(wb.active)
@@ -1092,11 +1116,6 @@ async def build_and_send(report_type: str, debug_override: bool = False,
         out_path = out_dir / fname
         wb.save(out_path)
         log.info(f"Файл сохранён: {out_path}")
-
-        # Архивируем 24ч данные после месячного
-        if report_type == "monthly":
-            for ch in channels:
-                archive_monthly(ch, ym)
 
         return [out_path]
 

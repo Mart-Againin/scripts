@@ -313,6 +313,14 @@ async def process_channel(client, channel_id: str):
         log.info(f"  Финальных срезов снято: {final_count}")
 
     save_registry(username, registry)
+
+    # Архивируем посты старше 90 дней (финальные переезжают в archive/)
+    try:
+        from registry_manager import archive_old_posts
+        archive_old_posts(username)
+    except Exception as e:
+        log.warning(f"  Ошибка архивирования {username}: {e}")
+
     return final_count
 
 
