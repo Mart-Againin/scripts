@@ -1,14 +1,27 @@
 """
 paid_placements.py — чтение платных размещений из Google Sheets.
 
-Структура листа в Google Sheets (одна строка = одно размещение):
-  Канал | Площадка | Дата | Стоимость | Охват | Приток | Тип
+Структура листа:
+  Строки с зелёным фоном (или без числовых данных) — заголовок канала.
+  Название канала совпадает с полем "name" в DASHBOARD_CHANNELS.
 
-Тип: "пост" или "папка"
-  - пост: есть Охват, CPV/CPM считаются автоматически
-  - папка: Охват не важен (0 или пусто), главное Приток и CPF
+  Колонки данных (0-based):
+    A(0):  Площадка / название размещения
+    B(1):  Ссылка
+    C(2):  Дата (ДД.ММ или ДД.ММ.ГГГГ)
+    D(3):  Статус
+    E(4):  Подписчики
+    F(5):  Ср. охват 1 публикации
+    G(6):  Стоимость
+    H(7):  Охват
+    I(8):  CPV    — игнорируется (считаем сами)
+    J(9):  CPM    — игнорируется (считаем сами)
+    K(10): Приток подписчиков/заявок
+    L(11): CPF/CPL — игнорируется (считаем сами)
+    M(12): Формат — берём как есть ("папка", "пост", "1 бот" и т.д.)
 
-Формат даты: ДД.ММ.ГГГГ
+Строки пропускаются если нет ни стоимости ни охвата (запланированные без результатов).
+CPV/CPM/CPF скрипт считает сам из стоимости и охвата/притока.
 """
 
 import logging
@@ -17,14 +30,20 @@ from datetime import datetime
 
 log = logging.getLogger(__name__)
 
-# Индексы столбцов (0-based) в Google Sheet
-COL_CHANNEL  = 0  # @username канала
-COL_PLATFORM = 1  # название площадки размещения
-COL_DATE     = 2  # дата размещения
-COL_BUDGET   = 3  # стоимость в рублях
-COL_REACH    = 4  # охват (для постов)
-COL_INFLOW   = 5  # приток подписчиков/заявок
-COL_TYPE     = 6  # "пост" или "папка"
+# Индексы столбцов (0-based)
+COL_PLATFORM = 0   # Площадка / название размещения
+COL_LINK     = 1   # Ссылка
+COL_DATE     = 2   # Дата
+# COL_STATUS = 3   # Статус — не используется
+# COL_SUBS   = 4   # Подписчики — не используется
+# COL_AVG    = 5   # Ср. охват — не используется
+COL_BUDGET   = 6   # Стоимость
+COL_REACH    = 7   # Охват
+# COL_CPV    = 8   # CPV — считаем сами
+# COL_CPM    = 9   # CPM — считаем сами
+COL_INFLOW   = 10  # Приток подписчиков/заявок
+# COL_CPF    = 11  # CPF — считаем сами
+# COL_TYPE removed — тип определяется из COL_PLATFORM (колонка A)
 
 
 def _get_sheet_url() -> str | None:
@@ -40,15 +59,43 @@ def _parse_num(val) -> float | None:
         return None
 
 
-def _parse_date(val) -> str | None:
+def _parse_date(val, year_hint: int = None) -> str | None:
     if not val:
         return None
+    s = str(val).strip()
+    # Пробуем форматы с годом
     for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y"):
         try:
-            return datetime.strptime(str(val).strip(), fmt).strftime("%Y-%m-%d")
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
         except ValueError:
             continue
-    return str(val)
+    # Формат ДД.ММ без года — добавляем год из подсказки
+    for fmt in ("%d.%m", "%d/%m"):
+        try:
+            d = datetime.strptime(s, fmt)
+            year = year_hint or datetime.now().year
+            return d.replace(year=year).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def _is_header_row(row: list) -> bool:
+    """Строка-заголовок канала: есть текст в A, нет даты в C."""
+    if not row or not str(row[0]).strip():
+        return False
+    date = str(row[2]).strip() if len(row) > 2 else ""
+    return not date
+
+
+def _placement_type(platform: str) -> str:
+    """Определяет тип размещения из названия платформы (колонка A).
+    Если название содержит слово 'папка' — тип 'папка'.
+    Иначе — полное название из A.
+    """
+    if "папк" in platform.lower():
+        return "папка"
+    return platform
 
 
 def _cpv(budget, reach) -> float | None:
@@ -63,13 +110,22 @@ def _cpf(budget, inflow) -> float | None:
     return None
 
 
+def _name_to_channel(name: str, channels_config: dict) -> str | None:
+    """Сопоставляет название из таблицы с @username канала."""
+    name_clean = name.strip().lower()
+    for ch, cfg in channels_config.items():
+        if cfg.get("name", "").strip().lower() == name_clean:
+            return ch
+    return None
+
+
 def get_paid_placements(channel: str, date_from, date_to) -> list[dict]:
     """
     Возвращает платные размещения для канала за период.
     Каждый элемент:
     {
-        platform, date, budget, reach, inflow,
-        placement_type,  # "пост" | "папка"
+        platform, link, date, budget, reach, inflow,
+        placement_type,  # из колонки M как есть
         cpv, cpf, cpm
     }
     """
@@ -81,7 +137,6 @@ def get_paid_placements(channel: str, date_from, date_to) -> list[dict]:
     try:
         import gspread
         from google.oauth2.service_account import Credentials
-        import os
 
         creds_path = os.getenv("GOOGLE_SHEETS_CREDENTIALS")
         if not creds_path:
@@ -99,40 +154,65 @@ def get_paid_placements(channel: str, date_from, date_to) -> list[dict]:
         rows        = ws.get_all_values()
 
     except Exception as e:
-        log.error(f"Ошибка чтения платных размещений: {e}")
+        log.error(f"Ошибка чтения платных размещений из Google Sheets: {e}")
         return []
 
     if len(rows) < 2:
         return []
 
-    ch_clean   = channel.lstrip("@").lower()
-    df_str     = date_from.strftime("%Y-%m-%d")
-    dt_str     = date_to.strftime("%Y-%m-%d")
-    result     = []
+    # Загружаем конфигурацию каналов для сопоставления названий
+    try:
+        from config import DASHBOARD_CHANNELS
+        channels_config = DASHBOARD_CHANNELS
+    except Exception:
+        channels_config = {}
 
-    for row in rows[1:]:  # пропускаем заголовок
-        if len(row) <= COL_TYPE:
-            continue
-        row_ch = row[COL_CHANNEL].lstrip("@").lower().strip()
-        if row_ch != ch_clean:
+    df_str   = date_from.strftime("%Y-%m-%d")
+    dt_str   = date_to.strftime("%Y-%m-%d")
+    year_hint = date_from.year
+
+    result          = []
+    current_channel = None  # текущий канал (определяется по заголовочной строке)
+
+    for row in rows[1:]:  # пропускаем строку заголовков таблицы
+        if not row or all(str(v).strip() == "" for v in row):
+            continue  # пустая строка
+
+        platform_val = str(row[0]).strip() if row else ""
+
+        # Проверяем — это заголовок канала?
+        if _is_header_row(row):
+            current_channel = _name_to_channel(platform_val, channels_config)
+            if not current_channel:
+                log.debug(f"Канал не найден для заголовка: '{platform_val}'")
             continue
 
-        row_date = _parse_date(row[COL_DATE])
+        # Если канал не определён — пропускаем
+        if not current_channel:
+            continue
+
+        # Нас интересует только нужный канал
+        if current_channel != channel:
+            continue
+
+        row_date = _parse_date(row[COL_DATE] if len(row) > COL_DATE else "", year_hint)
         if not row_date or not (df_str <= row_date <= dt_str):
             continue
 
-        budget = _parse_num(row[COL_BUDGET])
-        reach  = _parse_num(row[COL_REACH])
-        inflow = _parse_num(row[COL_INFLOW])
-        p_type = row[COL_TYPE].strip().lower() if len(row) > COL_TYPE else "пост"
+        budget = _parse_num(row[COL_BUDGET]) if len(row) > COL_BUDGET else None
+        reach  = _parse_num(row[COL_REACH])  if len(row) > COL_REACH  else None
+        inflow = _parse_num(row[COL_INFLOW]) if len(row) > COL_INFLOW else None
+        link   = str(row[COL_LINK]).strip()  if len(row) > COL_LINK   else ""
+        p_type = _placement_type(platform_val)
 
         result.append({
-            "platform":       row[COL_PLATFORM].strip(),
+            "platform":       platform_val,
+            "link":           link,
             "date":           row_date,
             "budget":         budget,
             "reach":          reach,
             "inflow":         inflow,
-            "placement_type": "папка" if "папк" in p_type else "пост",
+            "placement_type": p_type or "пост",
             "cpv":            _cpv(budget, reach),
             "cpf":            _cpf(budget, inflow),
             "cpm":            round(budget / reach * 1000, 0) if budget and reach else None,
@@ -146,19 +226,19 @@ def get_channel_paid_summary(placements: list) -> dict:
     if not placements:
         return {}
 
-    total_budget  = sum(p["budget"]  or 0 for p in placements)
-    total_reach   = sum(p["reach"]   or 0 for p in placements)
-    total_inflow  = sum(p["inflow"]  or 0 for p in placements)
-    count         = len(placements)
+    total_budget = sum(p["budget"]  or 0 for p in placements)
+    total_reach  = sum(p["reach"]   or 0 for p in placements)
+    total_inflow = sum(p["inflow"]  or 0 for p in placements)
+    count        = len(placements)
 
     avg_cpv = round(total_budget / total_reach,  2) if total_reach  else None
     avg_cpf = round(total_budget / total_inflow, 2) if total_inflow else None
 
     return {
-        "count":        count,
-        "budget":       total_budget,
-        "reach":        total_reach  or None,
-        "inflow":       total_inflow or None,
-        "avg_cpv":      avg_cpv,
-        "avg_cpf":      avg_cpf,
+        "count":   count,
+        "budget":  total_budget,
+        "reach":   total_reach  or None,
+        "inflow":  total_inflow or None,
+        "avg_cpv": avg_cpv,
+        "avg_cpf": avg_cpf,
     }
