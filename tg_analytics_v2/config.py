@@ -1,80 +1,37 @@
-"""
-config.py — единая точка чтения конфигурации из .env.
 
-Все модули проекта (main.py, snapshot.py, historical.py, stories.py, report.py)
-импортируют настройки отсюда вместо того чтобы парсить .env самостоятельно.
-Это устраняет дублирование и гарантирует, что все части системы видят
-одни и те же значения.
-"""
+# ── Dashboard ──────────────────────────────────────────────────────────────
+DASHBOARD_MONTHS_HISTORY = int(os.getenv("DASHBOARD_MONTHS_HISTORY", "6"))
 
-import os
-from pathlib import Path
+# Фиксированные цвета и имена каналов для дашборда
+# Переопределяются через .env как DASHBOARD_CH_<username>=Имя:#ЦВЕТ
+def _load_dashboard_channels() -> dict:
+    defaults = {
+        "@ktsdaily":      {"name": "Программисты",  "color": "#EF4444"},
+        "@metaclass":     {"name": "Метакласс",     "color": "#2E7D32"},
+        "@kts_specials":  {"name": "Геймификация",  "color": "#EC407A"},
+        "@smartbotpro":   {"name": "Смартбот",      "color": "#29ABE2"},
+        "@inside_ai_tech":{"name": "Внутри AI",     "color": "#111111"},
+        "@kod_v_kaske":   {"name": "Код в каске",   "color": "#FB8C00"},
+    }
+    # Можно переопределить через .env: DASHBOARD_CH_ktsdaily=Программисты:#EF4444
+    result = {}
+    for ch, cfg in defaults.items():
+        key = "DASHBOARD_CH_" + ch.lstrip("@")
+        env_val = os.getenv(key)
+        if env_val and ":" in env_val:
+            name, color = env_val.rsplit(":", 1)
+            result[ch] = {"name": name.strip(), "color": color.strip()}
+        else:
+            result[ch] = cfg
+    return result
 
-import pytz
-from dotenv import load_dotenv
+DASHBOARD_CHANNELS = _load_dashboard_channels()
 
-load_dotenv()
+# Google Sheets
+GOOGLE_PAID_SHEET_URL = os.getenv("GOOGLE_PAID_SHEET_URL", "")
 
-# ── Telegram API ────────────────────────────────────────────────────────
-API_ID       = int(os.getenv("API_ID", "0"))
-API_HASH     = os.getenv("API_HASH", "")
-SESSION_NAME = os.getenv("SESSION_NAME", "tg_analytics")
-
-# ── Каналы ──────────────────────────────────────────────────────────────
-CHANNELS_RAW = os.getenv("CHANNELS", "")
-CHANNELS     = [c.strip() for c in CHANNELS_RAW.split(",") if c.strip()]
-
-
-def _parse_ids(key: str) -> list[int]:
-    """Парсит список Telegram ID из .env через запятую."""
-    raw = os.getenv(key, "")
-    return [int(x.strip()) for x in raw.split(",") if x.strip().lstrip("-").isdigit()]
-
-
-# ── Получатели и режим отладки ─────────────────────────────────────────
-RECIPIENT_IDS = _parse_ids("REPORT_RECIPIENT_ID")
-DEBUG_IDS     = _parse_ids("DEBUG_RECIPIENT_ID")
-MODERATOR_IDS = _parse_ids("MODERATOR_IDS")
-DEBUG_MODE    = os.getenv("DEBUG", "false").lower() == "true"
-DAILY_REPORT_TIME = os.getenv("DAILY_REPORT_TIME", "12:00")
-
-# ── Часовой пояс ────────────────────────────────────────────────────────
-TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Moscow")
-TZ            = pytz.timezone(TIMEZONE_NAME)
-
-# ── Папки ───────────────────────────────────────────────────────────────
-OUTPUT_DIR   = Path(os.getenv("OUTPUT_DIR", "output"))
-REGISTRY_DIR = Path(os.getenv("REGISTRY_DIR", "registry"))
-ARCHIVE_DIR  = Path(os.getenv("ARCHIVE_DIR", "archive"))
-LOGS_DIR     = Path(os.getenv("LOGS_DIR", "logs"))
-
-for _d in (OUTPUT_DIR/"daily", OUTPUT_DIR/"weekly", OUTPUT_DIR/"monthly",
-           REGISTRY_DIR, ARCHIVE_DIR, LOGS_DIR):
-    _d.mkdir(parents=True, exist_ok=True)
-
-# ── Веса CQI (Content Quality Index) ───────────────────────────────────
-CQI_W = {
-    "react":   int(os.getenv("CQI_W_REACT",   "1")),
-    "vote":    int(os.getenv("CQI_W_VOTE",     "2")),
-    "forward": int(os.getenv("CQI_W_FORWARD",  "4")),
-    "comment": int(os.getenv("CQI_W_COMMENT",  "5")),
+# ── Константы ──────────────────────────────────────────────────────────────
+MONTHS_RU = {
+    1:"Январь",2:"Февраль",3:"Март",4:"Апрель",5:"Май",6:"Июнь",
+    7:"Июль",8:"Август",9:"Сентябрь",10:"Октябрь",11:"Ноябрь",12:"Декабрь"
 }
-
-# ── Прокси (опционально) ────────────────────────────────────────────────
-PROXY_CFG = None
-if os.getenv("PROXY_TYPE"):
-    import socks
-    _proxy_types = {"socks5": socks.SOCKS5, "socks4": socks.SOCKS4, "http": socks.HTTP}
-    PROXY_CFG = (
-        _proxy_types.get(os.getenv("PROXY_TYPE", "socks5").lower(), socks.SOCKS5),
-        os.getenv("PROXY_HOST"),
-        int(os.getenv("PROXY_PORT", "1080")),
-        True,
-        os.getenv("PROXY_USERNAME") or None,
-        os.getenv("PROXY_PASSWORD") or None,
-    )
-
-
-def get_telethon_kwargs() -> dict:
-    """Возвращает kwargs для TelegramClient (прокси, если настроен)."""
-    return {"proxy": PROXY_CFG} if PROXY_CFG else {}

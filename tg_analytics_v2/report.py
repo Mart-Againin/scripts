@@ -160,6 +160,7 @@ POST_COLS = [
     ("Дата публ.",   "date",         11, False, False),
     ("Время",        "time",         10, False, False),
     ("Ссылка",       "url",          28, False, False),
+    ("Тема",         "text_short",   35, False, False),
     ("Тип контента", "content_type", 14, False, False),
     ("Охват",        "views",        12, False, False),
     ("Реакции",      "reactions",    11, False, False),
@@ -285,6 +286,15 @@ async def get_channel_posts(client, channel_username: str,
         from registry_manager import load_registry
         reg = load_registry(channel_username)
         subscribers = reg.get("subscribers", 0)
+
+    # Извлекаем тему (первые 9 слов текста, без URL и переносов)
+    import re as _re
+    for p in posts_by_id.values():
+        if "text_short" not in p:
+            text = p.get("message", "") or p.get("text", "") or ""
+            text_clean = _re.sub(r'https?://\S+', '', text).replace('\n', ' ').strip()
+            words = text_clean.split()
+            p["text_short"] = " ".join(words[:9]) + ("..." if len(words) > 9 else "")
 
     posts = sorted(posts_by_id.values(),
                    key=lambda x: (x.get("date",""), x.get("time","")))
@@ -1009,6 +1019,7 @@ async def build_and_send(report_type: str, debug_override: bool = False,
     out_dir.mkdir(parents=True, exist_ok=True)
 
     async def _execute(client):
+        # Данные для листа "Посты 24ч" — финальные срезы + текущие для незавершённых
         channels_data = []
         for ch in channels:
             posts, subs = await get_channel_posts(
@@ -1018,6 +1029,26 @@ async def build_and_send(report_type: str, debug_override: bool = False,
                 "subscribers":  subs,
                 "posts":        posts,
             })
+
+        # Данные для листа "Посты-месяц" — только текущая статистика из Telegram
+        # (накопленная на дату запроса, без наложения 24ч констант)
+        channels_data_month = []
+        if report_type == "monthly":
+            import historical as _hist_mod
+            for ch in channels:
+                month_posts, subs = await _hist_mod.get_posts_for_period(
+                    client, ch, d_from, d_to, force=force_rebuild)
+                for p in month_posts:
+                    p["_note"] = "📸 тек."
+                # Берём subscribers из channels_data если hist не вернул
+                if not subs:
+                    subs = next((c["subscribers"] for c in channels_data
+                                 if c["channel_id"] == ch), 0)
+                channels_data_month.append({
+                    "channel_id":  ch,
+                    "subscribers": subs,
+                    "posts":       month_posts,
+                })
 
         wb = Workbook(); wb.remove(wb.active)
 
@@ -1030,9 +1061,9 @@ async def build_and_send(report_type: str, debug_override: bool = False,
                 "Статистика через ~24 ч после публикации. Жёлтый = исторические данные.",
             )
             results_mo = build_multichannel_posts_sheet(
-                wb.create_sheet("Посты-месяц"), channels_data,
+                wb.create_sheet("Посты-месяц"), channels_data_month,
                 f"📋 ПОСТЫ-МЕСЯЦ — {month_name.upper()} {d_from.year}",
-                "Накопленная статистика на дату сбора.",
+                "Накопленная статистика на дату запроса отчёта.",
             )
             # Сводку строим из results_mo
             # Подмешиваем данные о приросте подписчиков и сторис
@@ -1116,6 +1147,27 @@ async def build_and_send(report_type: str, debug_override: bool = False,
         out_path = out_dir / fname
         wb.save(out_path)
         log.info(f"Файл сохранён: {out_path}")
+
+        # Выгрузка в Google Sheets (только для месячного отчёта)
+        if report_type == "monthly":
+            try:
+                import google_sheets as gs
+                import stories as stories_mod
+
+                # Собираем данные сторис по каналам
+                stories_data = {}
+                for ch in channels:
+                    ch_username = ch.lstrip("@")
+                    ch_stories  = stories_mod.get_stories_for_period(
+                        ch, d_from, d_to)
+                    if ch_stories:
+                        stories_data[ch_username] = ch_stories
+
+                await gs.upload_monthly_report(
+                    channels_data_month, stories_data,
+                    month_label=period_label, ym=ym)
+            except Exception as e:
+                log.error(f"Ошибка выгрузки в Google Sheets: {e}")
 
         return [out_path]
 
