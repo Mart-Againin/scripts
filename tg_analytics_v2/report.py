@@ -25,12 +25,11 @@ report.py — генератор Excel-отчётов.
 
 import argparse
 import asyncio
-import json
 import logging
 import sys
 from calendar import monthrange
 from collections import Counter
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from openpyxl import Workbook
@@ -42,7 +41,7 @@ from telethon import TelegramClient
 from config import (
     API_ID, API_HASH, SESSION_NAME, CHANNELS,
     RECIPIENT_IDS, DEBUG_IDS, DEBUG_MODE,
-    OUTPUT_DIR, REGISTRY_DIR, ARCHIVE_DIR, LOGS_DIR,
+    OUTPUT_DIR, LOGS_DIR,
     TZ, CQI_W, get_telethon_kwargs,
 )
 
@@ -122,7 +121,6 @@ def calc(snap: dict, subscribers: int) -> dict:
     c  = snap.get("comments",  0)
     f  = snap.get("forwards",  0)
     vt = snap.get("votes",     0)
-    act= snap.get("actions",   0)
     sub= subscribers or 0
     cqi_raw = (r * CQI_W["react"] + vt * CQI_W["vote"] +
                f * CQI_W["forward"] + c * CQI_W["comment"])
@@ -179,44 +177,6 @@ POST_COLS = [
     ("Примечание",   "_note",        20, False, False),
 ]
 N_COLS = len(POST_COLS)
-
-# ── Реестр ────────────────────────────────────────────────────────────────
-def load_registry(channel_username: str) -> dict:
-    ch   = channel_username.lstrip("@")
-    path = REGISTRY_DIR / ch / "registry.json"
-    if not path.exists(): return {}
-    try:    return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        log.error(f"Ошибка реестра {path}: {e}"); return {}
-
-def posts_for_period(registry: dict, date_from: date, date_to: date) -> list:
-    result = []
-    for p in registry.get("posts", {}).values():
-        if not p.get("is_final") or not p.get("snapshot"): continue
-        try:   d = datetime.strptime(p["date"], "%Y-%m-%d").date()
-        except (KeyError, ValueError): continue
-        if date_from <= d <= date_to:
-            result.append(p)
-    return sorted(result, key=lambda x: (x.get("date",""), x.get("time","")))
-
-def archive_monthly(channel_username: str, ym: str):
-    ch       = channel_username.lstrip("@")
-    reg_path = REGISTRY_DIR / ch / "registry.json"
-    if not reg_path.exists(): return
-    registry = json.loads(reg_path.read_text(encoding="utf-8"))
-    posts    = registry.get("posts", {})
-    to_arch  = {mid: p for mid, p in posts.items()
-                if p.get("is_final") and p.get("date","")[:7] == ym}
-    remaining= {mid: p for mid, p in posts.items() if mid not in to_arch}
-    if to_arch:
-        arch_dir  = ARCHIVE_DIR / ch; arch_dir.mkdir(parents=True, exist_ok=True)
-        arch_path = arch_dir / f"archive_{ym}.json"
-        arch_path.write_text(
-            json.dumps({"channel_id": channel_username, "month": ym, "posts": to_arch},
-                       ensure_ascii=False, indent=2), encoding="utf-8")
-        log.info(f"Архивировано {len(to_arch)} постов → {arch_path}")
-    registry["posts"] = remaining
-    reg_path.write_text(json.dumps(registry, ensure_ascii=False, indent=2), encoding="utf-8")
 
 # ── Кэш отчётов ───────────────────────────────────────────────────────────
 def get_cached_report_path(ym: str) -> Path | None:
@@ -299,7 +259,6 @@ async def get_channel_posts(client, channel_username: str,
     posts = sorted(posts_by_id.values(),
                    key=lambda x: (x.get("date",""), x.get("time","")))
     return posts, subscribers
-
 # ── Построение листа с постами всех каналов ──────────────────────────────
 def _channel_divider(ws, row: int, ch_id: str, subs: int, is_hist: bool = False):
     last = get_column_letter(N_COLS)
@@ -576,7 +535,6 @@ AGG_COLS_WEEK = [
 def _agg_bucket_row(ws, r: int, label: str, dow: str, posts: list,
                      subscribers: int, bg: str, mode: str):
     """mode = 'day' или 'week'"""
-    cols = AGG_COLS_DAY if mode=="day" else AGG_COLS_WEEK
     sn_all  = [p.get("snapshot",{}) for p in posts]
     metrics = [calc(sn, subscribers) for sn in sn_all]
     views_s = sum(sn.get("views",0) for sn in sn_all)
@@ -1055,7 +1013,7 @@ async def build_and_send(report_type: str, debug_override: bool = False,
         if report_type == "monthly":
             # Лист 1: Сводка
             ws_sum = wb.create_sheet("Сводка")
-            results_24h = build_multichannel_posts_sheet(
+            build_multichannel_posts_sheet(
                 wb.create_sheet("Посты 24ч"), channels_data,
                 f"📋 ПОСТЫ 24Ч — {month_name.upper()} {d_from.year}",
                 "Статистика через ~24 ч после публикации. Жёлтый = исторические данные.",
@@ -1077,7 +1035,11 @@ async def build_and_send(report_type: str, debug_override: bool = False,
 
             for cr in results_mo:
                 ch_id = cr["channel_id"]
-                cr["growth"] = _snap_mod.get_subscriber_growth(ch_id)
+                # Строго по границе месяца (см. snapshot.get_month_growth),
+                # а не "последние две попавшиеся записи в истории" —
+                # иначе прирост может относиться не к тому месяцу, который
+                # реально в отчёте.
+                cr["growth"] = {"month": _snap_mod.get_month_growth(ch_id, ym)}
                 if _stories_mod:
                     try:
                         cr["stories"] = _stories_mod.get_stories_summary(ch_id, d_from, d_to)

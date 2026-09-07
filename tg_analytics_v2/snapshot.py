@@ -17,7 +17,9 @@ import asyncio
 import json
 import logging
 import sys
-from datetime import datetime, timedelta, timezone
+from calendar import monthrange
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 from telethon import TelegramClient
 from telethon.tl.types import (
@@ -25,7 +27,6 @@ from telethon.tl.types import (
     DocumentAttributeVideo, DocumentAttributeAnimated,
 )
 
-from telegram_utils import detect_content_type, extract_poll_votes, extract_post_stats, collect_messages
 from config import (
     API_ID, API_HASH, SESSION_NAME, CHANNELS,
     REGISTRY_DIR, LOGS_DIR, DEBUG_MODE, TZ, get_telethon_kwargs,
@@ -144,45 +145,78 @@ def save_subscribers_history(channel_username: str, history: dict):
 
 def record_subscribers(channel_username: str, subscribers: int):
     """
-    Записывает число подписчиков раз в месяц (1-го числа).
-    Если запись за текущий месяц уже есть — не дублирует.
-    Ключ хранения: YYYY-MM (а не YYYY-MM-DD), потому что отслеживаем
-    только месячный прирост.
+    Записывает число подписчиков КАЖДЫЙ ДЕНЬ (ключ YYYY-MM-DD), обновляя
+    значение при каждом часовом проходе в течение дня — так в истории
+    остаётся счётчик на последний прогон каждого дня.
+
+    Это нужно для точной формулы прироста (см. get_month_growth ниже):
+    "текущая численность минус численность на последнее число прошлого
+    месяца" требует знать число подписчиков именно НА ГРАНИЦЕ месяца, а
+    не "первое что попалось в этом месяце".
+
+    Старые записи в формате "YYYY-MM" (без дня), сделанные до этого
+    изменения, НЕ удаляются и не трогаются — они остаются в файле как
+    есть и используются как запасной вариант для периодов ДО перехода на
+    ежедневную запись (см. get_subscribers_on_or_before).
     """
     today = datetime.now(TZ)
-    month_key = today.strftime("%Y-%m")
+    day_key = today.strftime("%Y-%m-%d")
 
     history = load_subscribers_history(channel_username)
 
-    # Записываем только если это первый день месяца ИЛИ записи за этот месяц ещё нет
-    # (защита от пропуска 1-го числа — например если скрипт был выключен)
-    if month_key not in history:
-        history[month_key] = subscribers
+    if history.get(day_key) != subscribers:
+        history[day_key] = subscribers
         save_subscribers_history(channel_username, history)
-        log.info(f"  [{channel_username}] Подписчики за {month_key} записаны: {subscribers}")
-    else:
-        log.debug(f"  [{channel_username}] Подписчики за {month_key} уже записаны, пропуск")
+        log.debug(f"  [{channel_username}] Подписчики на {day_key}: {subscribers}")
 
 
-def get_subscriber_growth(channel_username: str) -> dict:
+def get_subscribers_on_or_before(channel_username: str, target_date: date) -> int | None:
     """
-    Возвращает прирост подписчиков за месяц (сравнение с предыдущей
-    месячной записью). Дневной и недельный прирост больше не считаются —
-    подписчики фиксируются раз в месяц.
-    Если данных меньше двух месяцев — month будет None.
+    Возвращает число подписчиков на указанную дату (или ближайшую
+    предыдущую, если записи ровно на эту дату нет — например скрипт не
+    работал именно в этот день).
+
+    Использует ежедневные записи (ключ YYYY-MM-DD). Если для нужного
+    периода их ещё нет (данные собраны ДО перехода на ежедневную
+    точность) — подстраховывается старой месячной записью (YYYY-MM) того
+    же месяца, если она есть.
     """
     history = load_subscribers_history(channel_username)
-    if not history:
-        return {"current": None, "month": None}
+    target_str = target_date.strftime("%Y-%m-%d")
 
-    sorted_keys = sorted(history.keys())  # YYYY-MM по возрастанию
-    current = history.get(sorted_keys[-1]) if sorted_keys else None
-    prev    = history.get(sorted_keys[-2]) if len(sorted_keys) >= 2 else None
+    daily_keys = sorted(k for k in history if len(k) == 10 and k[4] == "-" and k[7] == "-")
+    candidates = [k for k in daily_keys if k <= target_str]
+    if candidates:
+        return history[candidates[-1]]
 
-    return {
-        "current": current,
-        "month":   (current - prev) if (current is not None and prev is not None) else None,
-    }
+    # Фолбэк на старую месячную запись (данные до перехода на ежедневную точность)
+    month_key = target_str[:7]
+    return history.get(month_key)
+
+
+def get_month_growth(channel_username: str, ym: str) -> int | None:
+    """
+    Прирост за месяц СТРОГО по формуле:
+        численность на последнее число месяца ym
+        минус
+        численность на последнее число предыдущего месяца
+    Число может быть положительным, отрицательным или нулём.
+    Если для одной из границ данных нет вообще — возвращает None
+    (не подставляет 0, чтобы не выдавать отсутствие данных за "нулевой рост").
+    """
+    year, month = int(ym[:4]), int(ym[5:7])
+    last_day_this = date(year, month, monthrange(year, month)[1])
+    if month == 1:
+        prev_year, prev_month = year - 1, 12
+    else:
+        prev_year, prev_month = year, month - 1
+    last_day_prev = date(prev_year, prev_month, monthrange(prev_year, prev_month)[1])
+
+    subs_now  = get_subscribers_on_or_before(channel_username, last_day_this)
+    subs_prev = get_subscribers_on_or_before(channel_username, last_day_prev)
+    if subs_now is None or subs_prev is None:
+        return None
+    return subs_now - subs_prev
 
 
 # ── Основная логика ───────────────────────────────────────────────────────
@@ -233,7 +267,7 @@ async def process_channel(client, channel_id: str):
     async for msg in client.iter_messages(entity, limit=200):
         if msg.date < cutoff:
             break
-        if msg.service or not msg.id:
+        if getattr(msg, "service", False) or not msg.id:
             continue
         grouped_id = getattr(msg, "grouped_id", None)
         if grouped_id:
@@ -260,6 +294,7 @@ async def process_channel(client, channel_id: str):
             "published_at": pub_utc.isoformat(),
             "deadline":     deadline.isoformat(),
             "content_type": detect_content_type(msg),
+            "message":      msg.message or "",
             "registered_at": now.isoformat(),
             "is_final":     False,
             "snapshot":     None,
@@ -270,7 +305,7 @@ async def process_channel(client, channel_id: str):
     if new_count:
         log.info(f"  Новых постов зарегистрировано: {new_count}")
     else:
-        log.debug(f"  Новых постов нет")
+        log.debug("  Новых постов нет")
 
     # ── Шаг 2: финальные срезы по постам у которых вышло 24 ч ───────────
     final_count = 0

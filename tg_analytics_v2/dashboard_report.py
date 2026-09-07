@@ -21,43 +21,16 @@ dashboard_report.py — генератор Dashboard-презентации (.pp
 
 import logging
 import os
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
 # ── Вспомогательные функции ───────────────────────────────────────────────
-
-def _fmt_num(v, decimals=0) -> str:
-    if v is None:
-        return "—"
-    if isinstance(v, float):
-        if decimals == 0:
-            v = int(round(v))
-        else:
-            v = round(v, decimals)
-    if isinstance(v, int) and abs(v) >= 1000:
-        return f"{v:,}".replace(",", " ")
-    return str(v)
-
-
-def _fmt_pct(v) -> str:
-    if v is None:
-        return "—"
-    return f"{round(v, 1)}%"
-
-
-def _fmt_money(v) -> str:
-    if v is None:
-        return "—"
-    return f"{int(v):,}".replace(",", " ") + " ₽"
-
-
-def _fmt_growth(v) -> str:
-    if v is None:
-        return "—"
-    return f"+{v}" if v > 0 else str(v)
-
+# (форматирование чисел/процентов/дат теперь делается на стороне JS-шаблона —
+#  см. fmtDate() и toLocaleString() внутри _make_pptx_script; отдельные
+#  Python-хелперы _fmt_num/_fmt_pct/_fmt_money/_fmt_growth/_footer_text были
+#  дублирующим мёртвым кодом и удалены)
 
 def _channel_color(ch: str, cfg: dict) -> str:
     """Возвращает hex-цвет без # для pptxgenjs."""
@@ -67,10 +40,6 @@ def _channel_color(ch: str, cfg: dict) -> str:
 
 def _channel_name(ch: str, cfg: dict) -> str:
     return cfg.get(ch, {}).get("name", ch)
-
-
-def _footer_text() -> str:
-    return "Данные Telegram фиксируются через ~24 часа после публикации; платные размещения вводятся отдельно."
 
 
 # ── Генератор PPTX через pptxgenjs ────────────────────────────────────────
@@ -87,10 +56,11 @@ def _build_pptx(output_path: Path, all_data: dict, ym: str,
         "channels_config":  dict,
     }
     """
-    import json as _json
     import subprocess
     import tempfile
 
+    NODE_PATH = r"C:\Users\admin\AppData\Roaming\npm\node_modules"
+    
     script = _make_pptx_script(all_data, str(output_path), ym,
                                 period_label, history_range)
 
@@ -102,7 +72,8 @@ def _build_pptx(output_path: Path, all_data: dict, ym: str,
     try:
         result = subprocess.run(
             ["node", script_path],
-            capture_output=True, text=True, timeout=120
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "NODE_PATH": NODE_PATH}  # <-- ДОБАВИТЬ
         )
         if result.returncode != 0:
             log.error(f"pptxgenjs error: {result.stderr}")
@@ -140,9 +111,23 @@ def _make_pptx_script(all_data: dict, output_path: str,
             })
         return series
 
+    def hist_series_nullable(key):
+        """Как hist_series(), но сохраняет None как null (не подменяет на 0) —
+        нужно для VRpost, где отсутствие данных за месяц не должно рисоваться
+        как 0%."""
+        series = []
+        for ch in channels_order:
+            vals = [h.get(key) for h in (history.get(ch) or [])]
+            series.append({
+                "name":   _channel_name(ch, cfg),
+                "color":  _channel_color(ch, cfg),
+                "values": vals,
+            })
+        return series
+
     subs_series   = hist_series("subscribers")
     reach_series  = hist_series("avg_reach")
-    growth_series = hist_series("growth")
+    vrpost_series = hist_series_nullable("vrpost")
     err_series    = hist_series("err")
 
     # Контентная активность (слайд 7)
@@ -157,6 +142,9 @@ def _make_pptx_script(all_data: dict, output_path: str,
         "period_label":  period_label,
         "history_range": history_range,
         "month_label":   mlabel,
+        "title_month_name": all_data.get("title_month_name", ""),
+        "title_year":       all_data.get("title_year", ""),
+        "channels_count":   all_data.get("channels_count", len(chs)),
         "month_labels":  month_labels,
         "global":        g,
         "channels":      chs,
@@ -167,7 +155,7 @@ def _make_pptx_script(all_data: dict, output_path: str,
         "reach_avgs":    reach_avgs,
         "subs_series":   subs_series,
         "reach_series":  reach_series,
-        "growth_series": growth_series,
+        "vrpost_series": vrpost_series,
         "err_series":    err_series,
         "paid":          paid,
         "cfg":           cfg,
@@ -196,6 +184,17 @@ function footer(slide) {{
     slide.addShape(pres.shapes.LINE,
         {{ x:0.3, y:FOOTER_Y-0.05, w:SLIDE_W-0.6, h:0,
            line:{{ color:"CCCCCC", width:0.5 }} }});
+}}
+
+// Единый формат даты для всей презентации: "YYYY-MM-DD" -> "дд.мм.гг"
+function fmtDate(d) {{
+    if (!d) return "—";
+    const s = String(d);
+    const parts = s.split("-");
+    if (parts.length === 3 && parts[0].length === 4) {{
+        return parts[2] + "." + parts[1] + "." + parts[0].slice(2);
+    }}
+    return s;
 }}
 
 function kicker(slide, text) {{
@@ -233,14 +232,14 @@ function statBox(slide, x, y, w, h, label, value, sub) {{
     }});
 }}
 
-function lineChart(slide, x, y, w, h, series, cats, title, showLegend) {{
+function lineChart(slide, x, y, w, h, series, cats, title, showLegend, minY) {{
     const chartData = series.map(s => ({{
         name: s.name,
         labels: cats,
-        values: s.values
+        values: s.values   // null внутри values — pptxgenjs рисует разрыв линии, не 0
     }}));
     const colors = series.map(s => s.color);
-    slide.addChart(pres.charts.LINE, chartData, {{
+    const opts = {{
         x, y, w, h,
         chartColors: colors,
         lineDataSymbol: "circle",
@@ -258,19 +257,30 @@ function lineChart(slide, x, y, w, h, series, cats, title, showLegend) {{
         catGridLine: {{ style:"none" }},
         dataLabelColor: GRAY,
         chartArea: {{ fill:{{ color:WHITE }} }},
-    }});
+    }};
+    if (minY !== undefined && minY !== null) {{
+        opts.valAxisMinVal = minY;
+    }}
+    slide.addChart(pres.charts.LINE, chartData, opts);
 }}
 
 function barChart(slide, x, y, w, h, labels, values, colors, chartTitle) {{
-    const chartData = labels.map((name, i) => ({{
-        name,
-        labels: [name],
-        values: [values[i]]
-    }}));
+    // ВАЖНО: одна серия с массивом категорий (labels) и массивом значений
+    // (values), а НЕ отдельная серия на каждый канал. Прежняя реализация
+    // создавала N серий, каждая со своим "name" — из-за этого pptxgenjs
+    // путал подписи/легенду и везде показывал имя первого канала
+    // ("Метакласс"), а по бокам от реального столбца рисовались лишние
+    // нулевые столбцы других серий.
+    const chartData = [{{
+        name:   chartTitle || "Значение",
+        labels: labels,
+        values: values,
+    }}];
     slide.addChart(pres.charts.BAR, chartData, {{
         x, y, w, h,
         barDir: "col",
-        chartColors: colors,
+        chartColors: colors,          // цвет каждой точки — по каналу
+        barGapWidthPct: 220,          // widget: узкие столбцы, широкий зазор (правило 35-45% / 55-65%)
         showTitle: !!chartTitle,
         title: chartTitle || "",
         titleFontSize: 11,
@@ -279,6 +289,7 @@ function barChart(slide, x, y, w, h, labels, values, colors, chartTitle) {{
         showValue: true,
         dataLabelFontSize: 9,
         dataLabelColor: GRAY,
+        dataLabelFormatCode: "#,##0;;",   // не показывать подпись для 0/пусто
         catAxisLabelColor: GRAY,
         valAxisLabelColor: GRAY,
         valGridLine: {{ color:"E2E8F0", size:0.5 }},
@@ -293,6 +304,7 @@ function hBarChart(slide, x, y, w, h, labels, values, color, chartTitle) {{
         x, y, w, h,
         barDir: "bar",
         chartColors: [color],
+        barGapWidthPct: 220,
         showTitle: !!chartTitle,
         title: chartTitle || "",
         titleFontSize: 11,
@@ -302,6 +314,7 @@ function hBarChart(slide, x, y, w, h, labels, values, color, chartTitle) {{
         dataLabelFontSize: 9,
         dataLabelColor: GRAY,
         dataLabelPosition: "outEnd",
+        dataLabelFormatCode: "#,##0;;",
         catAxisLabelColor: GRAY,
         valAxisLabelColor: GRAY,
         valGridLine: {{ style:"none" }},
@@ -315,130 +328,122 @@ const pres = new pptxgen();
 pres.layout = "LAYOUT_WIDE";
 DATA.footer_text = "Данные Telegram фиксируются через ~24 часа после публикации; платные размещения вводятся отдельно.";
 
-// ════════ СЛАЙД 1: ОБЛОЖКА ════════════════════════════════════════════════
+// ════════ СЛАЙД 1: ТИТУЛЬНЫЙ (светлая аналитическая композиция) ══════════
 {{
     const s = pres.addSlide();
-    s.background = {{ color: NAVY }};
+    s.background = {{ color: "FCFCFD" }};
+
+    // ── Левая часть: заголовок + параметры отчёта ─────────────────────────
     s.addText("Telegram-каналы", {{
-        x:0.5, y:1.8, w:SLIDE_W-1, h:0.8,
-        fontSize:36, bold:true, color:WHITE, align:"center"
+        x:0.6, y:0.7, w:6.6, h:0.75,
+        fontSize:32, bold:true, color:NAVY, align:"left"
     }});
-    s.addText("Аналитический отчёт", {{
-        x:0.5, y:2.6, w:SLIDE_W-1, h:0.5,
-        fontSize:20, color:"CADCFC", align:"center"
+    s.addText("Dashboard-презентация: визуальная структура для автоматизации отчёта", {{
+        x:0.6, y:1.45, w:6.6, h:0.5,
+        fontSize:12, color:GRAY, align:"left"
     }});
-    s.addText(DATA.period_label, {{
-        x:0.5, y:3.4, w:SLIDE_W-1, h:0.4,
-        fontSize:16, color:"CADCFC", align:"center"
+
+    const infoLines = [
+        "Отчётный месяц: " + DATA.title_month_name + " " + DATA.title_year,
+        "Динамика: " + DATA.history_range,
+        "Каналов в отчёте: " + DATA.channels_count,
+    ];
+    infoLines.forEach((line, i) => {{
+        s.addText(line, {{
+            x:0.6, y:2.25 + i*0.42, w:6.6, h:0.38,
+            fontSize:14, color:"222222", align:"left"
+        }});
     }});
-    s.addText("Динамика: " + DATA.history_range, {{
-        x:0.5, y:3.85, w:SLIDE_W-1, h:0.35,
-        fontSize:13, color:"8C9BC4", align:"center", italic:true
-    }});
-    // Каналы и цвета
-    const chList = DATA.channels.map((m,i) => {{
-        const name = DATA.cfg[m.channel] ? DATA.cfg[m.channel].name : m.channel;
-        const color = DATA.cfg[m.channel] ? DATA.cfg[m.channel].color.replace("#","") : "FFFFFF";
+
+    // ── Правая часть: вертикальный список каналов ─────────────────────────
+    const chList = DATA.channels.map(m => {{
+        const name  = DATA.cfg[m.channel] ? DATA.cfg[m.channel].name : m.channel;
+        const color = DATA.cfg[m.channel] ? DATA.cfg[m.channel].color.replace("#","") : "333333";
         return {{ name, color, subscribers: m.subscribers }};
     }});
-    const colW = (SLIDE_W - 1.0) / chList.length;
+    const rx = 7.6, rw = 5.2, rowH = 0.62, rowGap = 0.14;
     chList.forEach((ch, i) => {{
-        const x = 0.5 + i * colW;
-        s.addShape(pres.shapes.OVAL, {{ x: x+colW/2-0.12, y:5.1, w:0.24, h:0.24, fill:{{ color:ch.color }} }});
-        s.addText(ch.name, {{ x, y:5.4, w:colW, h:0.3, align:"center", fontSize:11, color:WHITE }});
-        s.addText(ch.subscribers ? (ch.subscribers >= 1000 ? (ch.subscribers/1000).toFixed(1)+"K" : String(ch.subscribers))+" подп." : "—",
-            {{ x, y:5.72, w:colW, h:0.25, align:"center", fontSize:9, color:"8C9BC4" }});
+        const ry = 0.7 + i * (rowH + rowGap);
+        // карточка
+        s.addShape(pres.shapes.RECTANGLE, {{
+            x:rx, y:ry, w:rw, h:rowH,
+            fill:{{ color:"FFFFFF" }},
+            line:{{ color:"E4E4E7", width:1 }}
+        }});
+        // цветная полоса слева
+        s.addShape(pres.shapes.RECTANGLE, {{
+            x:rx, y:ry, w:0.08, h:rowH, fill:{{ color:ch.color }}
+        }});
+        s.addText(ch.name, {{
+            x:rx+0.25, y:ry, w:rw*0.55, h:rowH, valign:"middle",
+            fontSize:12, bold:true, color:NAVY
+        }});
+        const subsLabel = ch.subscribers
+            ? (ch.subscribers >= 1000 ? (ch.subscribers/1000).toFixed(1)+"K подписчиков" : String(ch.subscribers)+" подписчиков")
+            : "— подписчиков";
+        s.addText(subsLabel, {{
+            x:rx+rw*0.5, y:ry, w:rw*0.48, h:rowH, valign:"middle", align:"right",
+            fontSize:11, color:GRAY
+        }});
     }});
     s.addText("Цвет канала сохраняется на всех общих графиках.", {{
-        x:0.5, y:6.4, w:SLIDE_W-1, h:0.28,
-        fontSize:9, color:"8C9BC4", align:"center", italic:true
+        x:rx, y:0.7 + chList.length*(rowH+rowGap) + 0.1, w:rw, h:0.3,
+        fontSize:9, color:GRAY, italic:true
     }});
-    s.addText("01", {{ x:SLIDE_W-0.8, y:SLIDE_H-0.4, w:0.5, h:0.3, fontSize:10, color:"8C9BC4", align:"right" }});
+
+    // ── Нижняя часть ───────────────────────────────────────────────────────
+    s.addText(DATA.footer_text, {{
+        x:0.6, y:SLIDE_H-0.5, w:8.0, h:0.3,
+        fontSize:8, color:GRAY, align:"left"
+    }});
+    s.addText("01", {{ x:SLIDE_W-0.8, y:SLIDE_H-0.5, w:0.5, h:0.3, fontSize:10, color:GRAY, align:"right" }});
 }}
 
-// ════════ СЛАЙД 2: EXEC SUMMARY ОБЩИЙ ════════════════════════════════════
+// ════════ СЛАЙДЫ 2-5: ОБЩАЯ ДИНАМИКА ═════════════════════════════════════
+// Подписчики → Средний охват → VRpost → ER
+// (слайд "Прирост подписчиков" убран и заменён на "Динамику VRpost";
+//  общий Exec Summary тоже убран — он дублировал данные из блоков каналов)
 {{
-    const s = pres.addSlide();
-    const g = DATA.global;
-    kicker(s, "Общий обзор");
-    title(s, "Executive Summary", DATA.period_label);
-    const boxes = [
-        {{ label:"Общая аудитория",    value: g.total_subscribers >= 1000 ? (g.total_subscribers/1000).toFixed(1)+"K" : String(g.total_subscribers||"—"), sub:"на конец месяца" }},
-        {{ label:"Прирост аудитории",  value: g.total_growth > 0 ? "+"+g.total_growth : String(g.total_growth||"—"), sub:"за месяц" }},
-        {{ label:"Темп роста",         value: g.growth_pct ? g.growth_pct+"%" : "—", sub:"к прошлому периоду" }},
-        {{ label:"Публикаций",         value: String(g.total_posts||"—"), sub:"за период" }},
-        {{ label:"Средний охват",      value: g.avg_reach ? Math.round(g.avg_reach) : "—", sub:"на публикацию" }},
-        {{ label:"ER (ERR)",           value: g.avg_err ? g.avg_err.toFixed(1)+"%" : "—", sub:"вовлечённость" }},
-    ];
-    const bw = 2.0, bh = 1.4, bx0 = 0.5, by = 1.7, gap = 0.15;
-    boxes.forEach((b,i) => statBox(s, bx0 + i*(bw+gap), by, bw, bh, b.label, b.value, b.sub));
+    // Слайд 2: Подписчики
+    const s2 = pres.addSlide();
+    kicker(s2, "Динамика · 6 месяцев");
+    title(s2, "Динамика подписчиков по всем каналам", DATA.history_range);
+    lineChart(s2, 0.5, 1.7, SLIDE_W-1, 4.8, DATA.subs_series, DATA.month_labels, null, true);
+    footer(s2);
+    s2.addText("02", {{ x:SLIDE_W-0.8, y:SLIDE_H-0.4, w:0.5, h:0.3, fontSize:10, color:GRAY, align:"right" }});
 
-    const ry = 3.4;
-    s.addText("Реакции: " + (g.total_react||"—") + "   Комментарии: " + (g.total_comments||"—") + "   Пересылки: " + (g.total_fwd||"—"), {{
-        x:0.5, y:ry, w:SLIDE_W-1, h:0.35,
-        fontSize:12, color:GRAY, align:"center"
-    }});
-
-    // Мини-бары по каналам
-    const bary = 3.9;
-    DATA.channels.forEach((m, i) => {{
-        const x = 0.5 + i*(bw+gap);
-        const color = DATA.cfg[m.channel] ? DATA.cfg[m.channel].color.replace("#","") : "5B8DEF";
-        const name  = DATA.cfg[m.channel] ? DATA.cfg[m.channel].name : m.channel;
-        s.addShape(pres.shapes.ROUNDED_RECTANGLE, {{ x, y:bary, w:bw, h:1.8, rectRadius:0.08, fill:{{ color:"F4F6FB" }} }});
-        s.addShape(pres.shapes.OVAL, {{ x:x+0.15, y:bary+0.15, w:0.18, h:0.18, fill:{{ color }} }});
-        s.addText(name, {{ x:x+0.4, y:bary+0.1, w:bw-0.5, h:0.3, fontSize:10, bold:true, color:NAVY }});
-        s.addText("Подп.: " + (m.subscribers||"—"), {{ x:x+0.15, y:bary+0.45, w:bw-0.3, h:0.25, fontSize:9, color:GRAY }});
-        s.addText("Охват: " + (m.avg_reach ? Math.round(m.avg_reach) : "—"), {{ x:x+0.15, y:bary+0.7, w:bw-0.3, h:0.25, fontSize:9, color:GRAY }});
-        s.addText("ER: " + (m.err ? m.err.toFixed(1)+"%" : "—"), {{ x:x+0.15, y:bary+0.95, w:bw-0.3, h:0.25, fontSize:9, color:GRAY }});
-        s.addText("Постов: " + (m.posts_count||0), {{ x:x+0.15, y:bary+1.2, w:bw-0.3, h:0.25, fontSize:9, color:GRAY }});
-    }});
-    footer(s);
-    s.addText("02", {{ x:SLIDE_W-0.8, y:SLIDE_H-0.4, w:0.5, h:0.3, fontSize:10, color:GRAY, align:"right" }});
-}}
-
-// ════════ СЛАЙДЫ 3-6: ОБЩАЯ ДИНАМИКА ════════════════════════════════════
-{{
-    // Слайд 3: Подписчики
+    // Слайд 3: Средний охват
     const s3 = pres.addSlide();
     kicker(s3, "Динамика · 6 месяцев");
-    title(s3, "Динамика подписчиков по всем каналам", DATA.history_range);
-    lineChart(s3, 0.5, 1.7, SLIDE_W-1, 4.8, DATA.subs_series, DATA.month_labels, null, true);
+    title(s3, "Динамика среднего охвата публикации", DATA.history_range);
+    lineChart(s3, 0.5, 1.7, SLIDE_W-1, 4.8, DATA.reach_series, DATA.month_labels, null, true);
     footer(s3);
     s3.addText("03", {{ x:SLIDE_W-0.8, y:SLIDE_H-0.4, w:0.5, h:0.3, fontSize:10, color:GRAY, align:"right" }});
 
-    // Слайд 4: Средний охват
+    // Слайд 4: VRpost (заменяет "Динамику прироста подписчиков")
     const s4 = pres.addSlide();
     kicker(s4, "Динамика · 6 месяцев");
-    title(s4, "Динамика среднего охвата публикации", DATA.history_range);
-    lineChart(s4, 0.5, 1.7, SLIDE_W-1, 4.8, DATA.reach_series, DATA.month_labels, null, true);
+    title(s4, "Динамика VRpost (средний коэффициент видимости)", DATA.history_range);
+    lineChart(s4, 0.5, 1.7, SLIDE_W-1, 4.6, DATA.vrpost_series, DATA.month_labels, null, true, 0);
+    s4.addText("VRpost показывает, какую долю аудитории в среднем охватывают публикации канала. Чем выше показатель, тем лучше видимость контента среди подписчиков.", {{
+        x:0.5, y:6.35, w:SLIDE_W-1, h:0.4, fontSize:9, color:GRAY, italic:true
+    }});
     footer(s4);
     s4.addText("04", {{ x:SLIDE_W-0.8, y:SLIDE_H-0.4, w:0.5, h:0.3, fontSize:10, color:GRAY, align:"right" }});
 
-    // Слайд 5: Прирост подписчиков (bar)
+    // Слайд 5: ER
     const s5 = pres.addSlide();
     kicker(s5, "Динамика · 6 месяцев");
-    title(s5, "Динамика прироста подписчиков", DATA.history_range);
-    lineChart(s5, 0.5, 1.7, SLIDE_W-1, 4.8, DATA.growth_series, DATA.month_labels, null, true);
-    s5.addText("Нулевая линия: значения выше — рост, ниже — отток аудитории.", {{
+    title(s5, "Динамика ER по каналам", DATA.history_range);
+    lineChart(s5, 0.5, 1.7, SLIDE_W-1, 4.8, DATA.err_series, DATA.month_labels, null, true);
+    s5.addText("ER рассчитывается из ERR (%) — действия / охват × 100%.", {{
         x:0.5, y:6.4, w:SLIDE_W-1, h:0.3, fontSize:9, color:GRAY, italic:true
     }});
     footer(s5);
     s5.addText("05", {{ x:SLIDE_W-0.8, y:SLIDE_H-0.4, w:0.5, h:0.3, fontSize:10, color:GRAY, align:"right" }});
-
-    // Слайд 6: ER
-    const s6 = pres.addSlide();
-    kicker(s6, "Динамика · 6 месяцев");
-    title(s6, "Динамика ER по каналам", DATA.history_range);
-    lineChart(s6, 0.5, 1.7, SLIDE_W-1, 4.8, DATA.err_series, DATA.month_labels, null, true);
-    s6.addText("ER рассчитывается из ERR (%) — действия / охват × 100%.", {{
-        x:0.5, y:6.4, w:SLIDE_W-1, h:0.3, fontSize:9, color:GRAY, italic:true
-    }});
-    footer(s6);
-    s6.addText("06", {{ x:SLIDE_W-0.8, y:SLIDE_H-0.4, w:0.5, h:0.3, fontSize:10, color:GRAY, align:"right" }});
 }}
 
-// ════════ СЛАЙД 7: КОНТЕНТНАЯ АКТИВНОСТЬ ═════════════════════════════════
+// ════════ СЛАЙД 6: КОНТЕНТНАЯ АКТИВНОСТЬ ═════════════════════════════════
 {{
     const s = pres.addSlide();
     kicker(s, "Отчётный месяц");
@@ -446,11 +451,11 @@ DATA.footer_text = "Данные Telegram фиксируются через ~24 
     barChart(s, 0.5, 1.8, 6.0, 4.5, DATA.ch_names, DATA.posts_counts, DATA.ch_colors, "Количество публикаций");
     barChart(s, 6.9, 1.8, 6.0, 4.5, DATA.ch_names, DATA.reach_avgs,   DATA.ch_colors, "Средний охват публикации");
     footer(s);
-    s.addText("07", {{ x:SLIDE_W-0.8, y:SLIDE_H-0.4, w:0.5, h:0.3, fontSize:10, color:GRAY, align:"right" }});
+    s.addText("06", {{ x:SLIDE_W-0.8, y:SLIDE_H-0.4, w:0.5, h:0.3, fontSize:10, color:GRAY, align:"right" }});
 }}
 
 // ════════ БЛОКИ ПО КАНАЛАМ ════════════════════════════════════════════════
-let slideNum = 8;
+let slideNum = 7;
 
 DATA.channels.forEach(m => {{
     const ch      = m.channel;
@@ -487,7 +492,7 @@ DATA.channels.forEach(m => {{
             {{ l:"Сторис",      v: String(m.stories_count||0), s:"выбранный месяц" }},
             {{ l:"Ср. охват",   v: m.avg_reach ? Math.round(m.avg_reach) : "—", s:"на 1 пост" }},
             {{ l:"ER",          v: m.err ? m.err.toFixed(1)+"%" : "—", s:"из ERR (%)" }},
-            {{ l:"CQI",         v: m.cqi ? m.cqi.toFixed(2) : "—", s:"качество контента" }},
+            {{ l:"VRpost",      v: (m.vrpost !== null && m.vrpost !== undefined) ? m.vrpost.toFixed(1)+"%" : "—", s:"коэфф. видимости" }},
         ];
         const bw2 = 1.7, bh2 = 1.3, bx0 = 0.5, by2 = 1.55, gap2 = 0.15;
         vals.forEach((b,i) => statBox(s, bx0+i*(bw2+gap2), by2, bw2, bh2, b.l, b.v, b.s));
@@ -528,8 +533,7 @@ DATA.channels.forEach(m => {{
         // Метрики справа
         const metrics2 = [
             {{ l:"ER (ERR %)",     v: m.err         ? m.err.toFixed(1)+"%"    : "—" }},
-            {{ l:"CQI",            v: m.cqi         ? m.cqi.toFixed(2)        : "—" }},
-            {{ l:"VRpost",         v: m.vrpost      ? m.vrpost.toFixed(1)+"%"  : "—" }},
+            {{ l:"VRpost",         v: (m.vrpost !== null && m.vrpost !== undefined) ? m.vrpost.toFixed(1)+"%" : "—" }},
             {{ l:"Viral Factor",   v: m.viral_factor? m.viral_factor.toFixed(1)+"%" : "—" }},
             {{ l:"Reply Rate",     v: m.reply_rate  ? m.reply_rate.toFixed(1)+"%"  : "—" }},
             {{ l:"Reach Mult.",    v: m.reach_mult  ? m.reach_mult.toFixed(2)+"x"  : "—" }},
@@ -542,6 +546,12 @@ DATA.channels.forEach(m => {{
             s.addShape(pres.shapes.ROUNDED_RECTANGLE, {{ x:mx2, y:my2, w:mw, h:mh, rectRadius:0.08, fill:{{ color:"F4F6FB" }} }});
             s.addText(mt.v, {{ x:mx2, y:my2+0.05, w:mw, h:mh*0.55, align:"center", fontSize:18, bold:true, color:"#"+color }});
             s.addText(mt.l, {{ x:mx2, y:my2+mh*0.55, w:mw, h:0.25, align:"center", fontSize:9, color:GRAY }});
+        }});
+        // Короткая расшифровка нового KPI (есть место под сеткой метрик)
+        const metricsRows = Math.ceil(metrics2.length/2);
+        s.addText("VRpost — коэффициент видимости", {{
+            x:mx, y:my0 + metricsRows*(mh+mgap) + 0.05, w:mw*2+mgap+0.1, h:0.25,
+            fontSize:8, italic:true, color:GRAY, align:"center"
         }});
 
         footer(s);
@@ -567,41 +577,55 @@ DATA.channels.forEach(m => {{
             {{ title:"Лучший по реакциям",  data: bw_data.best_react }},
             {{ title:"Лучший по ER",        data: bw_data.best_er }},
         ];
+        // Порядок в карточке строго: Дата·Тип → Охват·ER·Реакции → Ссылка/Открыть → текст поста (post_preview)
         const cw = 4.1;
         bests.forEach((b, i) => {{
             const x = 0.5 + i*(cw+0.1);
-            s.addShape(pres.shapes.ROUNDED_RECTANGLE, {{ x, y:1.55, w:cw, h:1.5, rectRadius:0.08, fill:{{ color:"F4F6FB" }} }});
-            s.addText(b.title, {{ x, y:1.6, w:cw, h:0.3, align:"center", fontSize:10, bold:true, color:NAVY }});
+            s.addShape(pres.shapes.ROUNDED_RECTANGLE, {{ x, y:1.55, w:cw, h:1.95, rectRadius:0.08, fill:{{ color:"F4F6FB" }} }});
+            s.addText(b.title, {{ x, y:1.6, w:cw, h:0.28, align:"center", fontSize:10, bold:true, color:NAVY }});
             if (b.data) {{
-                s.addText(b.data.date + " · " + b.data.content_type, {{ x, y:1.92, w:cw, h:0.25, align:"center", fontSize:9, color:GRAY }});
-                if (b.data.text_short) s.addText(b.data.text_short, {{ x:x+0.1, y:2.17, w:cw-0.2, h:0.28, align:"center", fontSize:8, color:GRAY, italic:true }});
-                s.addText((b.data.views||"—")+" просм. · "+(b.data.reactions||"—")+" реакц. · ER "+(b.data.err ? b.data.err.toFixed(1)+"%" : "—"),
-                    {{ x, y:b.data.text_short ? 2.46 : 2.17, w:cw, h:0.25, align:"center", fontSize:9, color:GRAY }});
-                if (b.data.url) s.addText(b.data.url||"", {{ x, y:b.data.text_short ? 2.72 : 2.44, w:cw, h:0.2, align:"center", fontSize:8, color:"5B8DEF", hyperlink:{{ url: b.data.url||"#" }} }});
+                s.addText(fmtDate(b.data.date) + " · " + b.data.content_type,
+                    {{ x, y:1.9, w:cw, h:0.24, align:"center", fontSize:9, color:GRAY }});
+                s.addText((b.data.views||"—")+" просм. · ER "+(b.data.err ? b.data.err.toFixed(1)+"%" : "—")+" · "+(b.data.reactions||"—")+" реакц.",
+                    {{ x, y:2.14, w:cw, h:0.24, align:"center", fontSize:9, color:GRAY }});
+                if (b.data.url) s.addText("Открыть", {{ x, y:2.38, w:cw, h:0.2, align:"center", fontSize:8, color:"5B8DEF", hyperlink:{{ url: b.data.url||"#" }} }});
+                s.addText(b.data.post_preview || b.data.text_short || "Без текста",
+                    {{ x:x+0.15, y:2.62, w:cw-0.3, h:0.8, align:"center", fontSize:8, color:GRAY, italic:true }});
             }} else {{
                 s.addText("—", {{ x, y:2.0, w:cw, h:0.5, align:"center", fontSize:14, color:GRAY }});
             }}
         }});
 
-        // TOP-5 по охвату (горизонтальный бар)
+        // TOP-5 по охвату (горизонтальный бар) — по правилу больше НЕ показываем
+        // тип публикации в подписи, только дату в едином формате дд.мм.гг.
+        // reverse() — PowerPoint/pptxgenjs рисует горизонтальные столбцы
+        // снизу вверх (первый элемент массива внизу), поэтому чтобы 1-е
+        // место оказалось СВЕРХУ, а 5-е — снизу, передаём данные в
+        // обратном порядке.
         if (bw_data.top5_reach && bw_data.top5_reach.length > 0) {{
-            const top5labels = bw_data.top5_reach.map((p,i) => (i+1)+". "+p.date.slice(5)+" "+p.content_type);
-            const top5vals   = bw_data.top5_reach.map(p => p.views||0);
-            hBarChart(s, 0.5, 3.2, 6.3, 3.5, top5labels, top5vals, color, "TOP-5 по охвату");
+            const top5_pairs = bw_data.top5_reach.map((p,i) => ({{
+                label: (i+1)+". "+fmtDate(p.date),
+                value: p.views||0,
+            }})).reverse();
+            const top5labels = top5_pairs.map(x => x.label);
+            const top5vals   = top5_pairs.map(x => x.value);
+            hBarChart(s, 0.5, 3.65, 6.3, 3.05, top5labels, top5vals, color, "TOP-5 по охвату");
         }}
 
         // Худшие посты (3 карточки справа)
         if (bw_data.worst3 && bw_data.worst3.length > 0) {{
-            s.addText("Ниже среднего / точки внимания", {{ x:7.1, y:3.2, w:5.8, h:0.3, fontSize:11, bold:true, color:NAVY }});
+            s.addText("Ниже среднего / точки внимания", {{ x:7.1, y:3.65, w:5.8, h:0.3, fontSize:11, bold:true, color:NAVY }});
             bw_data.worst3.forEach((p, i) => {{
                 if (!p) return;
-                const wy = 3.6 + i*1.1;
-                s.addShape(pres.shapes.ROUNDED_RECTANGLE, {{ x:7.1, y:wy, w:5.8, h:1.0, rectRadius:0.08, fill:{{ color:"FFF5F5" }} }});
-                s.addText(p.date + " · " + p.content_type, {{ x:7.2, y:wy+0.05, w:5.6, h:0.28, fontSize:10, bold:true, color:NAVY }});
+                const wy = 4.0 + i*1.05;
+                s.addShape(pres.shapes.ROUNDED_RECTANGLE, {{ x:7.1, y:wy, w:5.8, h:0.95, rectRadius:0.08, fill:{{ color:"FFF5F5" }} }});
+                s.addText(fmtDate(p.date) + " · " + p.content_type, {{ x:7.2, y:wy+0.05, w:5.6, h:0.24, fontSize:10, bold:true, color:NAVY }});
                 s.addText((p.views||"—")+" просм. · ER "+(p.err ? p.err.toFixed(1)+"%" : "—")+
                     (p.deviation ? "  (" + (p.deviation > 0 ? "+" : "")+p.deviation+"% к среднему)" : ""),
-                    {{ x:7.2, y:wy+0.33, w:5.6, h:0.25, fontSize:9, color:GRAY }});
-                if (p.url) s.addText("открыть", {{ x:7.2, y:wy+0.6, w:2, h:0.22, fontSize:8, color:"5B8DEF", hyperlink:{{ url: p.url }} }});
+                    {{ x:7.2, y:wy+0.29, w:4.6, h:0.22, fontSize:9, color:GRAY }});
+                if (p.url) s.addText("Открыть", {{ x:11.3, y:wy+0.29, w:1.5, h:0.22, fontSize:8, color:"5B8DEF", align:"right", hyperlink:{{ url: p.url }} }});
+                s.addText(p.post_preview || p.text_short || "Без текста",
+                    {{ x:7.2, y:wy+0.53, w:5.6, h:0.38, fontSize:8, color:GRAY, italic:true }});
             }});
         }}
 
@@ -666,7 +690,7 @@ DATA.channels.forEach(m => {{
             const bg2   = ri%2 === 0 ? "FFFFFF" : "F4F6FB";
             const vals2 = [
                 p.platform,
-                p.date ? p.date.slice(5).split("-").reverse().join(".") : "—",
+                fmtDate(p.date),
                 p.budget ? p.budget.toLocaleString("ru")+" ₽" : "—",
                 p.reach  ? p.reach.toLocaleString("ru") : "—",
                 p.inflow ? p.inflow.toLocaleString("ru") : "—",
@@ -701,7 +725,7 @@ async def build_dashboard(client, ym: str, date_from: date, date_to: date,
     Генерирует Dashboard-презентацию за месяц и отправляет в Telegram.
     """
     from config import (CHANNELS, DASHBOARD_CHANNELS, OUTPUT_DIR,
-                        RECIPIENT_IDS, DEBUG_IDS, TZ, CQI_W)
+                        RECIPIENT_IDS)
     from history_db import (ensure_seeded, get_all_channels_history,
                              record_month_from_report)
     from dashboard_metrics import (build_channel_metrics, build_global_metrics)
@@ -721,22 +745,31 @@ async def build_dashboard(client, ym: str, date_from: date, date_to: date,
     year_n = int(ym[:4]); month_n = int(ym[5:7])
     month_label   = f"{MONTHS_RU.get(month_n,'')} {year_n}"
     period_label  = f"Отчётный месяц: {month_label}"
+    title_month_name = MONTHS_RU.get(month_n, "").lower()  # "июль" для титульного слайда
 
     # История за 6 месяцев
     history = get_all_channels_history(CHANNELS, months=6, end_ym=ym)
 
-    # Метки диапазона истории
+    # Метки диапазона истории (корректно обрабатываем переход через год,
+    # например "Авг 2026 – Янв 2027")
     all_months = list(list(history.values())[0]) if history else []
     if all_months:
-        first = all_months[0]["month_label"]
-        last  = all_months[-1]["month_label"]
-        history_range = f"{first}–{last} {year_n}"
+        first_entry, last_entry = all_months[0], all_months[-1]
+        first_label = first_entry["month_label"]
+        last_label  = last_entry["month_label"]
+        first_year  = int(first_entry["ym"][:4])
+        last_year   = int(last_entry["ym"][:4])
+        if first_year == last_year:
+            history_range = f"{first_label}–{last_label} {last_year}"
+        else:
+            history_range = f"{first_label} {first_year} – {last_label} {last_year}"
     else:
         history_range = ym
 
     # Данные по каналам
-    channel_metrics = []
-    paid_data       = {}
+    channel_metrics  = []
+    paid_data        = {}
+    posts_for_history = {}  # ch -> posts, нужно чтобы честно записать историю ниже
 
     for ch in CHANNELS:
         # Посты — сначала 24ч срезы, остальное историческое
@@ -775,6 +808,7 @@ async def build_dashboard(client, ym: str, date_from: date, date_to: date,
         ch_hist = history.get(ch, [])
         metrics = build_channel_metrics(ch, posts, ch_stories, subs, ch_hist)
         channel_metrics.append(metrics)
+        posts_for_history[ch] = posts  # сохраняем реальные посты для записи истории
 
         # Платные размещения
         paid_data[ch] = get_paid_placements(ch, date_from, date_to)
@@ -809,6 +843,9 @@ async def build_dashboard(client, ym: str, date_from: date, date_to: date,
         "history_data":    history_for_js,
         "paid":            {ch: paid_data.get(ch, []) for ch in CHANNELS},
         "month_label":     month_label,
+        "title_month_name":title_month_name,
+        "title_year":      year_n,
+        "channels_count":  len(channel_metrics),
         "channels_config": cfg_for_js,
     }
 
@@ -827,10 +864,15 @@ async def build_dashboard(client, ym: str, date_from: date, date_to: date,
                     pass
         return None
 
-    # Записываем в историю
+    # Записываем в историю — ВАЖНО: передаём реальные посты канала, а не
+    # заглушку []. Раньше здесь стояло "posts": [], из-за чего
+    # record_month_from_report() всегда пропускал запись (см. её код:
+    # if not posts: continue) и history_db.json никогда не пополнялся
+    # из дашборда — это и было причиной "пустых" графиков за текущий месяц.
     record_month_from_report(ym, [
         {"channel_id": m["channel"], "subscribers": m["subscribers"],
-         "posts": []} for m in channel_metrics
+         "posts": posts_for_history.get(m["channel"], [])}
+        for m in channel_metrics
     ])
 
     # Отправка

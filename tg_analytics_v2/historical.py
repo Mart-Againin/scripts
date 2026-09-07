@@ -221,6 +221,7 @@ async def fetch_and_cache_month(client, channel_username: str,
             "time":          pub_local.strftime("%H:%M"),
             "hour":          pub_local.hour,
             "content_type":  _detect_content_type(msg),
+            "message":       msg.message or "",
             "is_final":      True,
             "is_historical": True,
             "snapshot": {

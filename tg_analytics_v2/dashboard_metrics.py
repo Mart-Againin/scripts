@@ -6,22 +6,33 @@ dashboard_metrics.py — расчёт агрегатов для дашборда
 """
 
 import logging
-from datetime import date
+import re as _re
 
 log = logging.getLogger(__name__)
 
-MONTHS_RU = {
-    1:"Январь",2:"Февраль",3:"Март",4:"Апрель",5:"Май",6:"Июнь",
-    7:"Июль",8:"Август",9:"Сентябрь",10:"Октябрь",11:"Ноябрь",12:"Декабрь"
-}
 
-
-def metric_or_na(value):
-    """Возвращает '—' если значение None или 0 без смысла."""
-    if value is None:
-        return "—"
-    return value
-
+def make_post_preview(post: dict, n_words: int = 9) -> str:
+    """
+    Формирует короткое текстовое превью поста для карточек Dashboard.
+    Правило:
+      1. Берём полный текст поста.
+      2. Убираем все URL.
+      3. Схлопываем переносы строк/табы/повторяющиеся пробелы в один пробел.
+      4. Обрезаем пробелы по краям.
+      5. Берём первые n_words слов (если слов меньше — весь текст).
+      6. Если текста нет вообще — "Без текста".
+    """
+    text = post.get("message", "") or post.get("text", "") or ""
+    if not text.strip():
+        return "Без текста"
+    text = _re.sub(r'https?://\S+', '', text)
+    text = _re.sub(r'[\r\n\t]+', ' ', text)
+    text = _re.sub(r' {2,}', ' ', text).strip()
+    if not text:
+        return "Без текста"
+    words = text.split()
+    preview = " ".join(words[:n_words])
+    return preview if preview else "Без текста"
 
 def _safe_div(a, b, pct=False, decimals=2):
     if not b:
@@ -43,17 +54,21 @@ def calc_post_metrics(posts: list, subscribers: int) -> dict:
     fwd_list      = []
     votes_list    = []
     actions_list  = []
+    vrpost_list   = []  # VRpost по каждому посту отдельно — для среднего (см. ниже)
 
     for p in posts:
         sn = p.get("snapshot") or {}
         if not sn:
             continue
-        views_list.append(sn.get("views", 0) or 0)
+        views = sn.get("views", 0) or 0
+        views_list.append(views)
         react_list.append(sn.get("reactions", 0) or 0)
         comments_list.append(sn.get("comments", 0) or 0)
         fwd_list.append(sn.get("forwards", 0) or 0)
         votes_list.append(sn.get("votes", 0) or 0)
         actions_list.append(sn.get("actions", 0) or 0)
+        if subscribers:
+            vrpost_list.append(views / subscribers * 100)
 
     if not views_list:
         return {}
@@ -79,7 +94,12 @@ def calc_post_metrics(posts: list, subscribers: int) -> dict:
                total_comments* CQI_W["comment"])
     cqi = _safe_div(cqi_num, total_views, decimals=2)
 
-    vrpost      = _safe_div(total_views,    subscribers, pct=True)
+    # VRpost — среднее по постам (views_поста / подписчики × 100), а НЕ
+    # (сумма views за период) / подписчики. Это та же методика, что и
+    # колонка "Ср. VRpost (%)" в Excel-отчёте (report.py: calc() на пост +
+    # среднее по каналу) — важно, чтобы дашборд и Excel показывали одно и
+    # то же число для одного и того же периода.
+    vrpost      = round(sum(vrpost_list) / len(vrpost_list), 2) if vrpost_list else None
     viral_factor= _safe_div(total_fwd,      total_views, pct=True)
     reply_rate  = _safe_div(total_comments, total_views, pct=True)
     reach_mult  = _safe_div(total_views,    subscribers, decimals=2)
@@ -134,6 +154,7 @@ def get_best_worst_posts(posts: list, subscribers: int, top_n: int = 5) -> dict:
             "reactions":    sn.get("reactions", 0) or 0,
             "err":          p["_err"],
             "text_short":   p.get("text_short", ""),
+            "post_preview": make_post_preview(p),
         }
 
     # Средний охват для отклонения
