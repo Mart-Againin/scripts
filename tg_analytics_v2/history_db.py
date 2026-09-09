@@ -27,7 +27,8 @@ history_db.py — база данных исторических метрик п
 
 import json
 import logging
-from datetime import datetime
+from calendar import monthrange
+from datetime import date, datetime
 
 from config import REGISTRY_DIR, TZ
 
@@ -167,29 +168,48 @@ def get_all_channels_history(channels: list, months: int = 6,
 def record_month(ym: str, channel: str, subscribers: int, growth: int | None,
                  avg_reach: float, err: float, vrpost: float = None):
     """
-    Записывает данные за месяц для одного канала.
-    Если запись уже есть — не перезаписывает (данные константа).
+    Записывает данные за месяц для одного канала — источник: генерация
+    месячного Excel-отчёта (report.py) либо ручной импорт
+    (import_manual_stats.py / backfill_vrpost.py).
 
-    growth и vrpost могут быть None (нет данных для точного расчёта) —
-    в этом случае пишем None, а не 0, чтобы не путать "нет данных" с
-    "прирост/видимость равны нулю" (0 — вполне реальное значение и для
-    прироста, и в редких случаях для VRpost).
+    Разная защита для разных полей — не всё "константа" одинаково:
+
+    - subscribers и growth — ЗАПИСЫВАЮТСЯ ТОЛЬКО ОДИН РАЗ и больше НЕ
+      меняются при повторных вызовах. Причина: это "снимок на конец
+      месяца". Если отчёт за этот месяц пересобрать позже, свежий запрос
+      к Telegram вернёт ТЕКУЩЕЕ число подписчиков (на сегодня), а не то,
+      что было на конец ТОГО месяца — это была бы уже неверная замена
+      правильного значения на неправильное. Поэтому первая записанная
+      цифра остаётся навсегда.
+
+    - avg_reach, err, vrpost — ОБНОВЛЯЮТСЯ при каждом вызове (то есть
+      при каждой пересборке месячного отчёта). Это агрегаты по постам,
+      которые физически могут стать точнее со временем (например, у
+      поста дособрались комментарии/реакции) — здесь "более новое" не
+      значит "неправильное", в отличие от подписчиков.
     """
     db = load_db()
     if ym not in db:
         db[ym] = {}
-    if channel in db[ym]:
-        log.debug(f"history_db: {channel} {ym} уже записан, пропуск")
-        return
-    db[ym][channel] = {
-        "subscribers": subscribers,
-        "growth":      growth,
-        "avg_reach":   round(avg_reach, 1) if avg_reach else 0,
-        "err":         round(err, 2) if err else 0,
-        "vrpost":      round(vrpost, 2) if vrpost is not None else None,
-    }
+
+    existing = db[ym].get(channel)
+    if existing:
+        entry = dict(existing)  # подписчики/прирост из старой записи не трогаем
+    else:
+        entry = {"subscribers": subscribers, "growth": growth}
+
+    entry["avg_reach"] = round(avg_reach, 1) if avg_reach else 0
+    entry["err"]       = round(err, 2) if err else 0
+    entry["vrpost"]    = round(vrpost, 2) if vrpost is not None else None
+
+    db[ym][channel] = entry
     save_db(db)
-    log.info(f"history_db: записан {channel} {ym} — sub={subscribers} growth={growth} vrpost={vrpost}")
+
+    if existing:
+        log.info(f"history_db: {channel} {ym} — обновлены avg_reach/err/vrpost "
+                 f"(subscribers={entry['subscribers']} не тронут)")
+    else:
+        log.info(f"history_db: записан {channel} {ym} — sub={subscribers} growth={growth} vrpost={vrpost}")
 
 
 def record_month_from_report(ym: str, channels_data: list):
@@ -204,13 +224,30 @@ def record_month_from_report(ym: str, channels_data: list):
     """
     for cd in channels_data:
         ch    = cd["channel_id"]
-        subs  = cd.get("subscribers", 0)
         posts = cd.get("posts", [])
 
         if not posts:
             log.warning(f"history_db: {ch} {ym} — посты не переданы, "
                         f"запись истории пропущена (нет данных для агрегации)")
             continue
+
+        # Подписчики — СТРОГО на последний день месяца, последняя дневная
+        # запись (см. snapshot.record_subscribers/get_subscribers_on_or_before),
+        # а не "текущее" число на момент запроса отчёта. Раньше здесь
+        # использовалось cd["subscribers"] — живой снимок с момента сбора
+        # исторического кэша, который может относиться к любой дате
+        # (например, отчёт за июль, запрошенный 10 августа, получил бы
+        # число подписчиков НА 10 АВГУСТА, а не на 31 июля).
+        from snapshot import get_subscribers_on_or_before
+        year, month = int(ym[:4]), int(ym[5:7])
+        last_day = date(year, month, monthrange(year, month)[1])
+        subs = get_subscribers_on_or_before(ch, last_day)
+        if subs is None:
+            # Дневных записей ещё нет вообще (например, самый первый месяц
+            # работы скрипта) — фолбэк на то, что передал вызывающий код.
+            subs = cd.get("subscribers", 0)
+            log.warning(f"history_db: {ch} {ym} — нет дневной записи подписчиков "
+                        f"на {last_day}, использую текущее значение {subs} как фолбэк")
 
         # Средний охват
         views_list = [p.get("snapshot", {}).get("views", 0) for p in posts

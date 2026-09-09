@@ -100,10 +100,24 @@ def _make_pptx_script(all_data: dict, output_path: str,
     # Формируем данные для графиков истории
     month_labels = [h["month_label"] for h in (history.get(channels_order[0]) or [{}]*6)]
 
-    def hist_series(key):
+    def hist_series(key, nullable=False):
+        """
+        nullable=False (по умолчанию) — отсутствие данных превращает в 0
+        (для метрик, где 0 — не бывает валидным реальным значением при
+        наличии подписчиков, так что 0 однозначно читается как "нет
+        данных" по факту работы графика).
+        nullable=True — отсутствие данных остаётся None, pptxgenjs рисует
+        разрыв линии вместо ложного проседания в 0. Используем для всех
+        показателей, где реальный 0 возможен (VRpost, подписчики, охват,
+        ER) — иначе месяц без данных выглядит как настоящий обвал
+        показателя, а не как "данные ещё не собраны".
+        """
         series = []
         for ch in channels_order:
-            vals = [h.get(key) or 0 for h in (history.get(ch) or [])]
+            if nullable:
+                vals = [h.get(key) for h in (history.get(ch) or [])]
+            else:
+                vals = [h.get(key) or 0 for h in (history.get(ch) or [])]
             series.append({
                 "name":   _channel_name(ch, cfg),
                 "color":  _channel_color(ch, cfg),
@@ -111,24 +125,14 @@ def _make_pptx_script(all_data: dict, output_path: str,
             })
         return series
 
-    def hist_series_nullable(key):
-        """Как hist_series(), но сохраняет None как null (не подменяет на 0) —
-        нужно для VRpost, где отсутствие данных за месяц не должно рисоваться
-        как 0%."""
-        series = []
-        for ch in channels_order:
-            vals = [h.get(key) for h in (history.get(ch) or [])]
-            series.append({
-                "name":   _channel_name(ch, cfg),
-                "color":  _channel_color(ch, cfg),
-                "values": vals,
-            })
-        return series
-
-    subs_series   = hist_series("subscribers")
-    reach_series  = hist_series("avg_reach")
-    vrpost_series = hist_series_nullable("vrpost")
-    err_series    = hist_series("err")
+    # Все 4 показателя динамики — nullable=True: отсутствие данных за месяц
+    # (например месяц ещё не пересчитан) должно быть разрывом линии, а НЕ
+    # ложным провалом в ноль (0 подписчиков/охвата — это неправда и вводит
+    # в заблуждение сильнее, чем видимый разрыв в графике).
+    subs_series   = hist_series("subscribers", nullable=True)
+    reach_series  = hist_series("avg_reach",   nullable=True)
+    vrpost_series = hist_series("vrpost",      nullable=True)
+    err_series    = hist_series("err",         nullable=True)
 
     # Контентная активность (слайд 7)
     posts_counts  = [m["posts_count"]  for m in chs]
@@ -547,11 +551,24 @@ DATA.channels.forEach(m => {{
             s.addText(mt.v, {{ x:mx2, y:my2+0.05, w:mw, h:mh*0.55, align:"center", fontSize:18, bold:true, color:"#"+color }});
             s.addText(mt.l, {{ x:mx2, y:my2+mh*0.55, w:mw, h:0.25, align:"center", fontSize:9, color:GRAY }});
         }});
-        // Короткая расшифровка нового KPI (есть место под сеткой метрик)
+        // Расшифровка всех показателей (не только VRpost) — под сеткой метрик
         const metricsRows = Math.ceil(metrics2.length/2);
-        s.addText("VRpost — коэффициент видимости", {{
-            x:mx, y:my0 + metricsRows*(mh+mgap) + 0.05, w:mw*2+mgap+0.1, h:0.25,
-            fontSize:8, italic:true, color:GRAY, align:"center"
+        const legendItems = [
+            ["ER (ERR %)",   "доля аудитории, которая взаимодействует с контентом"],
+            ["VRpost",       "доля аудитории, которая увидела публикацию"],
+            ["Viral Factor", "показатель распространения контента за пределы основной аудитории"],
+            ["Reply Rate",   "доля аудитории, которая отвечает или вступает в диалог"],
+            ["Reach Mult.",  "во сколько раз фактический охват отличается от базовой аудитории"],
+        ];
+        const legendY0 = my0 + metricsRows*(mh+mgap) + 0.08;
+        legendItems.forEach((item, i) => {{
+            const ly = legendY0 + i*0.24;
+            s.addText([
+                {{ text: item[0] + " — ", options: {{ bold:true, color:GRAY, fontSize:7.5 }} }},
+                {{ text: item[1],         options: {{ color:GRAY, fontSize:7.5 }} }},
+            ], {{
+                x:mx, y:ly, w:mw*2+mgap+0.1, h:0.22, align:"left"
+            }});
         }});
 
         footer(s);
@@ -726,8 +743,7 @@ async def build_dashboard(client, ym: str, date_from: date, date_to: date,
     """
     from config import (CHANNELS, DASHBOARD_CHANNELS, OUTPUT_DIR,
                         RECIPIENT_IDS)
-    from history_db import (ensure_seeded, get_all_channels_history,
-                             record_month_from_report)
+    from history_db import ensure_seeded, get_all_channels_history
     from dashboard_metrics import (build_channel_metrics, build_global_metrics)
     from paid_placements import get_paid_placements
 
@@ -769,7 +785,6 @@ async def build_dashboard(client, ym: str, date_from: date, date_to: date,
     # Данные по каналам
     channel_metrics  = []
     paid_data        = {}
-    posts_for_history = {}  # ch -> posts, нужно чтобы честно записать историю ниже
 
     for ch in CHANNELS:
         # Посты — сначала 24ч срезы, остальное историческое
@@ -807,8 +822,28 @@ async def build_dashboard(client, ym: str, date_from: date, date_to: date,
 
         ch_hist = history.get(ch, [])
         metrics = build_channel_metrics(ch, posts, ch_stories, subs, ch_hist)
+
+        # Приоритет — данные из history_db.json (их пишет report.py при
+        # генерации месячного Excel-отчёта), а не собственный пересчёт
+        # дашборда. ch_hist[-1] — это как раз запись за ТЕКУЩИЙ ym (т.к.
+        # get_all_channels_history(..., end_ym=ym) заканчивается на нём).
+        # Если запись есть — берём её как более авторитетную; если нет
+        # (по этому каналу ещё ни разу не собирался месячный отчёт) —
+        # остаётся то, что дашборд посчитал сам только что (и НЕ
+        # записывается обратно в базу — писать в history_db.json теперь
+        # может только report.py, дашборд — только читает).
+        if ch_hist and ch_hist[-1].get("ym") == ym:
+            db_month = ch_hist[-1]
+            if db_month.get("subscribers"):
+                metrics["subscribers"] = db_month["subscribers"]
+            if db_month.get("avg_reach") is not None:
+                metrics["avg_reach"] = db_month["avg_reach"]
+            if db_month.get("err") is not None:
+                metrics["err"] = db_month["err"]
+            if db_month.get("vrpost") is not None:
+                metrics["vrpost"] = db_month["vrpost"]
+
         channel_metrics.append(metrics)
-        posts_for_history[ch] = posts  # сохраняем реальные посты для записи истории
 
         # Платные размещения
         paid_data[ch] = get_paid_placements(ch, date_from, date_to)
@@ -864,16 +899,12 @@ async def build_dashboard(client, ym: str, date_from: date, date_to: date,
                     pass
         return None
 
-    # Записываем в историю — ВАЖНО: передаём реальные посты канала, а не
-    # заглушку []. Раньше здесь стояло "posts": [], из-за чего
-    # record_month_from_report() всегда пропускал запись (см. её код:
-    # if not posts: continue) и history_db.json никогда не пополнялся
-    # из дашборда — это и было причиной "пустых" графиков за текущий месяц.
-    record_month_from_report(ym, [
-        {"channel_id": m["channel"], "subscribers": m["subscribers"],
-         "posts": posts_for_history.get(m["channel"], [])}
-        for m in channel_metrics
-    ])
+    # Dashboard больше не пишет в history_db.json — это делает
+    # report.py при генерации месячного Excel-отчёта. Если для этого
+    # месяца отчёт ещё ни разу не собирался — дашборд использует то,
+    # что только что посчитал сам (см. цикл по каналам выше), но эти
+    # цифры нигде не сохраняются; при следующей генерации Excel-отчёта
+    # за этот месяц они лягут в базу правильным путём.
 
     # Отправка
     recipients = override_recipients or RECIPIENT_IDS
