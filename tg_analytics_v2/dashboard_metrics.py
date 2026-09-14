@@ -125,7 +125,7 @@ def calc_post_metrics(posts: list, subscribers: int) -> dict:
 def get_best_worst_posts(posts: list, subscribers: int, top_n: int = 5) -> dict:
     """Определяет лучшие и худшие посты."""
     if not posts:
-        return {"best_reach": None, "best_react": None, "best_er": None,
+        return {"best_reach": None, "best_react": None, "best_er": None, "best_forwards": None,
                 "top5_reach": [], "worst3": []}
 
     scored = []
@@ -133,12 +133,14 @@ def get_best_worst_posts(posts: list, subscribers: int, top_n: int = 5) -> dict:
         sn = p.get("snapshot") or {}
         views   = sn.get("views", 0) or 0
         react   = sn.get("reactions", 0) or 0
+        fwd     = sn.get("forwards", 0) or 0
         actions = sn.get("actions", 0) or 0
         err     = round(actions / views * 100, 2) if views else 0
-        scored.append({**p, "_views": views, "_react": react, "_err": err})
+        scored.append({**p, "_views": views, "_react": react, "_fwd": fwd, "_err": err})
 
     by_views  = sorted(scored, key=lambda x: x["_views"],  reverse=True)
     by_react  = sorted(scored, key=lambda x: x["_react"],  reverse=True)
+    by_fwd    = sorted(scored, key=lambda x: x["_fwd"],    reverse=True)
     by_err    = sorted(scored, key=lambda x: x["_err"],    reverse=True)
     by_views_asc = sorted(scored, key=lambda x: x["_views"])
 
@@ -152,6 +154,7 @@ def get_best_worst_posts(posts: list, subscribers: int, top_n: int = 5) -> dict:
             "url":          p.get("url", ""),
             "views":        sn.get("views", 0) or 0,
             "reactions":    sn.get("reactions", 0) or 0,
+            "forwards":     sn.get("forwards", 0) or 0,
             "err":          p["_err"],
             "text_short":   p.get("text_short", ""),
             "post_preview": make_post_preview(p),
@@ -169,9 +172,10 @@ def get_best_worst_posts(posts: list, subscribers: int, top_n: int = 5) -> dict:
         worst.append(pf)
 
     return {
-        "best_reach": _fmt(by_views[0])  if by_views  else None,
-        "best_react": _fmt(by_react[0])  if by_react  else None,
-        "best_er":    _fmt(by_err[0])    if by_err    else None,
+        "best_reach":    _fmt(by_views[0]) if by_views else None,
+        "best_react":    _fmt(by_react[0]) if by_react else None,
+        "best_er":       _fmt(by_err[0])   if by_err   else None,
+        "best_forwards": _fmt(by_fwd[0])   if by_fwd   else None,
         "top5_reach": [_fmt(p) for p in by_views[:top_n]],
         "worst3":     worst,
     }

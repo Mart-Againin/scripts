@@ -151,7 +151,7 @@ def fv(cell, v, pct=False, flt=False):
     elif flt:
         cell.number_format = "0.00";  cell.value = v
     else:
-        cell.number_format = "#,##0"; cell.value = v
+        cell.number_format = "0"; cell.value = v
 
 # ── Столбцы постов ────────────────────────────────────────────────────────
 POST_COLS = [
@@ -162,8 +162,8 @@ POST_COLS = [
     ("Тип контента", "content_type", 14, False, False),
     ("Охват",        "views",        12, False, False),
     ("Реакции",      "reactions",    11, False, False),
+    ("Репосты",      "forwards",     12, False, False),
     ("Комменты",     "comments",     11, False, False),
-    ("Пересылки",    "forwards",     12, False, False),
     ("Голоса",       "votes",        10, False, False),
     ("Действия",     "actions",      12, False, False),
     ("ERR (%)",      "err",          10, True,  False),
@@ -263,7 +263,7 @@ async def get_channel_posts(client, channel_username: str,
 def _channel_divider(ws, row: int, ch_id: str, subs: int, is_hist: bool = False):
     last = get_column_letter(N_COLS)
     ws.merge_cells(f"A{row}:{last}{row}")
-    ws[f"A{row}"].value     = f"── {ch_id}  ({subs:,} подписчиков)"
+    ws[f"A{row}"].value     = f"── {ch_id}  ({subs} подписчиков)"
     ws[f"A{row}"].font      = _f(bold=True, sz=11, color=C["white"])
     ws[f"A{row}"].fill      = _fill(C["dark"])
     ws[f"A{row}"].alignment = _align(h="left")
@@ -393,8 +393,8 @@ SUMMARY_COLS = [
     ("Канал",              22), ("Подписчики",      13), ("+месяц",           10),
     ("Постов",             10), ("Сторис",           10),
     ("Охват постов",       14), ("Охват сторис",     14), ("Общий охват",      14),
-    ("Реакции (сумм.)",    13), ("Комменты (сумм.)", 13),
-    ("Пересылки (сумм.)",  14), ("Голоса (сумм.)",   12), ("Действия (сумм.)", 14),
+    ("Реакции (сумм.)",    13), ("Репосты (сумм.)",  13),
+    ("Комменты (сумм.)",   14), ("Голоса (сумм.)",   12), ("Действия (сумм.)", 14),
     ("Ср. ERR (%)",        11), ("Ср. ER (%)",       11),
     ("Ср. VRpost (%)",     12), ("Ср. Viral F.(%)",  13), ("Ср. Reply R.(%)",  13),
     ("Ср. Reach Mult.",    13), ("Ср. CQI",          10), ("Топ формат",       14),
@@ -436,8 +436,8 @@ def build_summary_sheet(ws, results: list, label: str, subtitle: str):
             cr["channel_id"], cr["subscribers"], growth.get("month"),
             cr["count"], stories_data.get("count", 0),
             views_posts, views_stories, views_total,
-            t.get("reactions"), t.get("comments"),
-            t.get("forwards"), t.get("votes"), t.get("actions"),
+            t.get("reactions"), t.get("forwards"),
+            t.get("comments"), t.get("votes"), t.get("actions"),
             a.get("err"), a.get("er"), a.get("vrpost"),
             a.get("vf"), a.get("reply"), a.get("rm"), a.get("cqi"),
             top_fmt, best_url, dtype,
@@ -473,7 +473,7 @@ def build_summary_sheet(ws, results: list, label: str, subtitle: str):
     ws[f"A{rt}"].border    = _b()
 
     keys = ["","","","count","_stories_count","_views_posts","_views_stories","_views_total",
-            "reactions","comments","forwards","votes","actions",
+            "reactions","forwards","comments","votes","actions",
             "err","er","vrpost","vf","reply","rm","cqi"]
     for j in range(3, n+1):
         cell = ws.cell(row=rt, column=j)
@@ -519,15 +519,15 @@ def build_summary_sheet(ws, results: list, label: str, subtitle: str):
 AGG_COLS_DAY = [
     ("Дата",          10), ("День недели",    14), ("Постов",  8),
     ("Охват",         12), ("Ср. охват",      12), ("Реакции", 11),
-    ("Комменты",      11), ("Пересылки",      12), ("Голоса",  10),
+    ("Репосты",       12), ("Комменты",       11), ("Голоса",  10),
     ("Действия",      12), ("Ср. ERR (%)",    11), ("Ср. ER (%)",11),
     ("Ср. VRpost (%)",12), ("Ср. Viral (%)",  12), ("Ср. CQI", 10),
     ("Лучший пост",   28),
 ]
 AGG_COLS_WEEK = [
     ("Неделя",        20), ("Постов",   8),
-    ("Охват",         12), ("Реакции",  11), ("Комменты", 11),
-    ("Пересылки",     12), ("Голоса",   10), ("Действия", 12),
+    ("Охват",         12), ("Реакции",  11), ("Репосты", 12),
+    ("Комменты",      11), ("Голоса",   10), ("Действия", 12),
     ("Ср. ERR (%)",   11), ("Ср. ER (%)",11),("Ср. VRpost (%)",12),
     ("Ср. CQI",       10), ("Лучший пост", 28),
 ]
@@ -557,8 +557,8 @@ def _agg_bucket_row(ws, r: int, label: str, dow: str, posts: list,
         _cv(4, views_s or None)
         _cv(5, round(views_s/len(posts),1) if posts else None, flt=True)
         _cv(6, sum(sn.get("reactions",0) for sn in sn_all) or None)
-        _cv(7, sum(sn.get("comments",0)  for sn in sn_all) or None)
-        _cv(8, sum(sn.get("forwards",0)  for sn in sn_all) or None)
+        _cv(7, sum(sn.get("forwards",0)  for sn in sn_all) or None)
+        _cv(8, sum(sn.get("comments",0)  for sn in sn_all) or None)
         _cv(9, sum(sn.get("votes",0)     for sn in sn_all) or None)
         _cv(10,sum(sn.get("actions",0)   for sn in sn_all) or None)
         _cv(11,lavg([m["err"]    for m in metrics]), pct=True)
@@ -576,8 +576,8 @@ def _agg_bucket_row(ws, r: int, label: str, dow: str, posts: list,
         _cv(2, len(posts))
         _cv(3, views_s or None)
         _cv(4, sum(sn.get("reactions",0) for sn in sn_all) or None)
-        _cv(5, sum(sn.get("comments",0)  for sn in sn_all) or None)
-        _cv(6, sum(sn.get("forwards",0)  for sn in sn_all) or None)
+        _cv(5, sum(sn.get("forwards",0)  for sn in sn_all) or None)
+        _cv(6, sum(sn.get("comments",0)  for sn in sn_all) or None)
         _cv(7, sum(sn.get("votes",0)     for sn in sn_all) or None)
         _cv(8, sum(sn.get("actions",0)   for sn in sn_all) or None)
         _cv(9, lavg([m["err"]    for m in metrics]), pct=True)
@@ -834,7 +834,7 @@ LEGEND = [
      "Все эмодзи-реакции под постом: 👍 ❤️ 🔥 и т.д.", "Базовые данные"),
     ("Комментарии",          "Telegram API: replies.replies",
      "Число комментариев в linked-группе канала", "Базовые данные"),
-    ("Пересылки (Forwards)", "Telegram API: message.forwards",
+    ("Репосты (Forwards)",   "Telegram API: message.forwards",
      "Сколько раз пост был переслан", "Базовые данные"),
     ("Голоса (Votes)",       "Telegram API: сумма voters по вариантам опроса",
      "Сумма всех голосов в опросе. Для постов без опроса = 0", "Базовые данные"),
@@ -993,11 +993,17 @@ async def build_and_send(report_type: str, debug_override: bool = False,
         channels_data_month = []
         if report_type == "monthly":
             import historical as _hist_mod
+            import re as _re
             for ch in channels:
                 month_posts, subs = await _hist_mod.get_posts_for_period(
                     client, ch, d_from, d_to, force=force_rebuild)
                 for p in month_posts:
                     p["_note"] = "📸 тек."
+                    if "text_short" not in p:
+                        text = p.get("message", "") or p.get("text", "") or ""
+                        text_clean = _re.sub(r'https?://\S+', '', text).replace('\n', ' ').strip()
+                        words = text_clean.split()
+                        p["text_short"] = " ".join(words[:9]) + ("..." if len(words) > 9 else "")
                 # Берём subscribers из channels_data если hist не вернул
                 if not subs:
                     subs = next((c["subscribers"] for c in channels_data

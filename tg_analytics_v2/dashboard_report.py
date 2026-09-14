@@ -42,6 +42,139 @@ def _channel_name(ch: str, cfg: dict) -> str:
     return cfg.get(ch, {}).get("name", ch)
 
 
+MONTHS_PREP_RU = {  # предложный падеж — "в августе", а не "в август"
+    1:"январе", 2:"феврале", 3:"марте", 4:"апреле", 5:"мае", 6:"июне",
+    7:"июле", 8:"августе", 9:"сентябре", 10:"октябре", 11:"ноябре", 12:"декабре",
+}
+
+
+def _delta_status(delta: float | None) -> str:
+    if delta is None:
+        return "stable"
+    if delta > 10:
+        return "up"
+    if delta < -10:
+        return "down"
+    return "stable"
+
+
+def build_activity_summary_text(month_num: int,
+                                 posts_current: int, reactions_current: int,
+                                 comments_current: int, forwards_current: int,
+                                 actions_current: int,
+                                 month_activities: list) -> str | None:
+    """
+    Короткий текстовый вывод под графиком "Активность и реакции
+    аудитории" — по алгоритму из ТЗ (сравнение текущего месяца со
+    средним за предыдущие 5 полных месяцев).
+
+    month_activities — список из 5 dict {posts_count, total_react,
+    total_comments, total_fwd, total_actions} за предыдущие 5 месяцев
+    (не обязательно в каком-то порядке).
+
+    Возвращает None, если сравнивать не с чем (0 постов в текущем
+    месяце, либо во всех 5 предыдущих сразу).
+    """
+    if not posts_current:
+        return None
+
+    reactions_per_post_current = reactions_current / posts_current
+    comments_per_post_current  = comments_current  / posts_current
+    forwards_per_post_current  = forwards_current  / posts_current
+    actions_per_post_current   = actions_current   / posts_current
+
+    # Месяцы с 0 постов исключаются из среднего "на публикацию" (иначе
+    # деление на 0), но не из avg_posts — там 0 постов - валидное число.
+    valid_months = [m for m in month_activities if m.get("posts_count")]
+    if not valid_months:
+        return None
+
+    avg_posts = sum(m.get("posts_count", 0) for m in month_activities) / len(month_activities)
+
+    def _avg_per_post(key):
+        vals = [m[key] / m["posts_count"] for m in valid_months]
+        return sum(vals) / len(vals)
+
+    avg_reactions_per_post = _avg_per_post("total_react")
+    avg_comments_per_post  = _avg_per_post("total_comments")
+    avg_forwards_per_post  = _avg_per_post("total_fwd")
+    avg_actions_per_post   = _avg_per_post("total_actions")
+
+    def _delta(curr, avg):
+        return (curr - avg) / avg * 100 if avg else None
+
+    posts_delta     = _delta(posts_current, avg_posts)
+    reactions_delta = _delta(reactions_per_post_current, avg_reactions_per_post)
+    comments_delta  = _delta(comments_per_post_current,  avg_comments_per_post)
+    forwards_delta  = _delta(forwards_per_post_current,  avg_forwards_per_post)
+    actions_delta   = _delta(actions_per_post_current,   avg_actions_per_post)
+
+    posts_status     = _delta_status(posts_delta)
+    actions_status   = _delta_status(actions_delta)
+    reactions_status = _delta_status(reactions_delta)
+    comments_status  = _delta_status(comments_delta)
+    forwards_status  = _delta_status(forwards_delta)
+
+    month_word = MONTHS_PREP_RU.get(month_num, "")
+
+    # А. Публикации
+    if posts_status == "up":
+        s1 = f"В {month_word} вышло на {round(abs(posts_delta))}% больше публикаций, чем в среднем за предыдущие 5 месяцев."
+    elif posts_status == "down":
+        s1 = f"В {month_word} вышло на {round(abs(posts_delta))}% меньше публикаций, чем в среднем за предыдущие 5 месяцев."
+    else:
+        s1 = f"В {month_word} количество публикаций осталось примерно на уровне среднего за предыдущие 5 месяцев."
+
+    # Б. Действия на публикацию
+    if actions_status == "up":
+        s2 = f"Количество действий на одну публикацию выросло на {round(abs(actions_delta))}%."
+    elif actions_status == "down":
+        s2 = f"Количество действий на одну публикацию снизилось на {round(abs(actions_delta))}%."
+    else:
+        s2 = "Количество действий на одну публикацию осталось примерно на среднем уровне."
+
+    # В. Реакции / Комментарии / Репосты (в ТЗ — "пересылки"; в остальном
+    # документе термин уже заменён на "репосты" — используем его для
+    # единообразия)
+    def _phrase(status, delta, verb_word, stable_text):
+        if status == "up":
+            return f"{verb_word} на {round(abs(delta))}% больше"
+        elif status == "down":
+            return f"{verb_word} на {round(abs(delta))}% меньше"
+        return stable_text
+
+    react_phrase = _phrase(reactions_status, reactions_delta,
+                            "реакций на публикацию стало",
+                            "реакции на публикацию остались примерно на среднем уровне")
+    comments_phrase = _phrase(comments_status, comments_delta,
+                               "комментариев на публикацию стало",
+                               "комментарии остались примерно на среднем уровне")
+    forwards_phrase = _phrase(forwards_status, forwards_delta,
+                               "репостов стало",
+                               "репосты остались примерно на среднем уровне")
+
+    s3 = f"{react_phrase[0].upper()}{react_phrase[1:]}, {comments_phrase}, а {forwards_phrase}."
+
+    # Г. Итоговая интерпретация — в первую очередь по actions_per_post;
+    # если объём контента (posts) тоже заметно изменился — уточняем.
+    if actions_status == "stable":
+        s4 = "В целом эффективность публикаций сохранилась на уровне предыдущих месяцев."
+    elif posts_status == "down" and actions_status == "up":
+        s4 = "Несмотря на меньший объём контента, аудитория взаимодействовала с публикациями активнее."
+    elif posts_status == "up" and actions_status == "up":
+        s4 = "Рост объёма контента сопровождался ростом активности аудитории."
+    elif posts_status == "up" and actions_status == "down":
+        s4 = "Публикаций стало больше, однако эффективность каждой отдельной публикации снизилась."
+    elif posts_status == "down" and actions_status == "down":
+        s4 = "Снижение объёма контента сопровождалось снижением активности аудитории."
+    elif posts_status == "stable" and actions_status == "up":
+        s4 = "При сопоставимом объёме контента аудитория взаимодействовала с публикациями активнее."
+    else:  # posts_status == "stable" and actions_status == "down"
+        s4 = "При сопоставимом объёме контента активность аудитории снизилась."
+
+    return " ".join([s1, s2, s3, s4])
+
+
 # ── Генератор PPTX через pptxgenjs ────────────────────────────────────────
 
 def _build_pptx(output_path: Path, all_data: dict, ym: str,
@@ -162,6 +295,7 @@ def _make_pptx_script(all_data: dict, output_path: str,
         "vrpost_series": vrpost_series,
         "err_series":    err_series,
         "paid":          paid,
+        "extra_paid":    all_data.get("extra_paid", {}),
         "cfg":           cfg,
     }, ensure_ascii=False)
 
@@ -268,6 +402,36 @@ function lineChart(slide, x, y, w, h, series, cats, title, showLegend, minY) {{
     slide.addChart(pres.charts.LINE, chartData, opts);
 }}
 
+function groupedBarChart(slide, x, y, w, h, labels, series, chartTitle) {{
+    // series: [{{name, values, color}}, ...] — используется для сравнения
+    // текущего месяца с предыдущим на одном графике (см. слайд
+    // "Показатели месяца" каждого канала).
+    const chartData = series.map(s => ({{ name: s.name, labels: labels, values: s.values }}));
+    const colors = series.map(s => s.color);
+    slide.addChart(pres.charts.BAR, chartData, {{
+        x, y, w, h,
+        barDir: "col",
+        chartColors: colors,
+        barGapWidthPct: 150,
+        showTitle: !!chartTitle,
+        title: chartTitle || "",
+        titleFontSize: 11,
+        titleColor: NAVY,
+        showLegend: true,
+        legendPos: "b",
+        legendFontSize: 8,
+        showValue: true,
+        dataLabelFontSize: 7,
+        dataLabelColor: GRAY,
+        dataLabelFormatCode: "#,##0;;",
+        catAxisLabelColor: GRAY,
+        valAxisLabelColor: GRAY,
+        valGridLine: {{ color:"E2E8F0", size:0.5 }},
+        catGridLine: {{ style:"none" }},
+        chartArea: {{ fill:{{ color:WHITE }} }},
+    }});
+}}
+
 function barChart(slide, x, y, w, h, labels, values, colors, chartTitle) {{
     // ВАЖНО: одна серия с массивом категорий (labels) и массивом значений
     // (values), а НЕ отдельная серия на каждый канал. Прежняя реализация
@@ -325,6 +489,82 @@ function hBarChart(slide, x, y, w, h, labels, values, color, chartTitle) {{
         catGridLine: {{ style:"none" }},
         chartArea: {{ fill:{{ color:WHITE }} }},
     }});
+}}
+
+// Универсальный слайд платных размещений — используется и для блока
+// каждого канала (paid_ch != null), и для "дополнительных" разделов
+// таблицы посевов, чьё название не совпало ни с одним каналом (см. цикл
+// по DATA.extra_paid ниже) — там вместо названия канала просто
+// подставляется название раздела как есть.
+function renderPaidSlide(title, color, paid_ch) {{
+    const s = pres.addSlide();
+    s.addShape(pres.shapes.RECTANGLE, {{ x:0, y:0, w:0.18, h:SLIDE_H, fill:{{ color }} }});
+    kicker(s, title + " · платные размещения");
+    s.addText(title + ": платные посевы", {{
+        x:0.5, y:0.45, w:SLIDE_W-0.7, h:0.65, fontSize:22, bold:true, color:NAVY
+    }});
+    s.addText(DATA.period_label, {{ x:0.5, y:1.1, w:SLIDE_W-0.7, h:0.3, fontSize:12, color:GRAY }});
+
+    const total_budget = paid_ch.reduce((a,p) => a+(p.budget||0), 0);
+    const total_reach  = paid_ch.reduce((a,p) => a+(p.reach||0), 0);
+    const total_inflow = paid_ch.reduce((a,p) => a+(p.inflow||0), 0);
+    const avg_cpv      = total_reach  ? Math.round(total_budget/total_reach*100)/100 : null;
+    const avg_cpf      = total_inflow ? Math.round(total_budget/total_inflow*100)/100 : null;
+
+    const bullets = [
+        "Размещений: " + paid_ch.length,
+        "Бюджет: " + (total_budget ? total_budget.toLocaleString("ru")+" ₽" : "—"),
+        "Охват: " + (total_reach  ? total_reach.toLocaleString("ru") : "—"),
+        "Приток: " + (total_inflow ? total_inflow.toLocaleString("ru") : "—"),
+        "Средний CPV: " + (avg_cpv  ? avg_cpv+" ₽"  : "—"),
+        "Средний CPF: " + (avg_cpf  ? avg_cpf+" ₽"  : "—"),
+    ];
+    s.addText(bullets.join("   ·   "), {{
+        x:0.5, y:1.5, w:SLIDE_W-0.7, h:0.35,
+        fontSize:11, color:NAVY, bold:false
+    }});
+
+    const plat_names = paid_ch.map(p => p.platform);
+    const reach_vals = paid_ch.map(p => p.reach || 0);
+    const cpf_vals   = paid_ch.map(p => p.cpf   || 0);
+
+    if (paid_ch.length > 1) {{
+        hBarChart(s, 0.5, 2.0, 5.8, 2.8, plat_names, reach_vals, color, "Охват по размещениям");
+        hBarChart(s, 6.9, 2.0, 5.8, 2.8, plat_names, cpf_vals,   color, "CPF по размещениям, ₽");
+    }}
+
+    const tby = 4.95;
+    const cols  = ["Площадка","Дата","Стоимость","Охват","Приток","CPV","CPF"];
+    const colW2 = [3.5, 1.3, 1.5, 1.2, 1.2, 1.2, 1.2];
+    let tx = 0.5;
+    cols.forEach((c, i) => {{
+        s.addShape(pres.shapes.RECTANGLE, {{ x:tx, y:tby, w:colW2[i], h:0.3, fill:{{ color:"1F3864" }} }});
+        s.addText(c, {{ x:tx, y:tby, w:colW2[i], h:0.3, align:"center", fontSize:8, bold:true, color:WHITE }});
+        tx += colW2[i];
+    }});
+    paid_ch.forEach((p, ri) => {{
+        let tx2 = 0.5;
+        const row_y = tby + 0.3 + ri*0.28;
+        const bg2   = ri%2 === 0 ? "FFFFFF" : "F4F6FB";
+        const vals2 = [
+            p.platform,
+            fmtDate(p.date),
+            p.budget ? p.budget.toLocaleString("ru")+" ₽" : "—",
+            p.reach  ? p.reach.toLocaleString("ru") : "—",
+            p.inflow ? p.inflow.toLocaleString("ru") : "—",
+            p.cpv    ? p.cpv+" ₽"  : "—",
+            p.cpf    ? p.cpf+" ₽"  : "—",
+        ];
+        vals2.forEach((v, i) => {{
+            s.addShape(pres.shapes.RECTANGLE, {{ x:tx2, y:row_y, w:colW2[i], h:0.27, fill:{{ color:bg2 }} }});
+            s.addText(String(v), {{ x:tx2, y:row_y, w:colW2[i], h:0.27, align: i===0?"left":"center", fontSize:8, color:GRAY, margin:3 }});
+            tx2 += colW2[i];
+        }});
+    }});
+
+    footer(s);
+    s.addText(String(slideNum).padStart(2,"0"), {{ x:SLIDE_W-0.8, y:SLIDE_H-0.4, w:0.5, h:0.3, fontSize:10, color:GRAY, align:"right" }});
+    slideNum++;
 }}
 
 // ── Начало ────────────────────────────────────────────────────────────────
@@ -501,7 +741,7 @@ DATA.channels.forEach(m => {{
         const bw2 = 1.7, bh2 = 1.3, bx0 = 0.5, by2 = 1.55, gap2 = 0.15;
         vals.forEach((b,i) => statBox(s, bx0+i*(bw2+gap2), by2, bw2, bh2, b.l, b.v, b.s));
 
-        s.addText("Реакции: "+(m.total_react||"—")+"   Комменты: "+(m.total_comments||"—")+"   Пересылки: "+(m.total_fwd||"—"), {{
+        s.addText("Реакции: "+(m.total_react||"—")+"   Комменты: "+(m.total_comments||"—")+"   Репосты: "+(m.total_fwd||"—"), {{
             x:0.5, y:3.05, w:SLIDE_W-0.7, h:0.3, fontSize:11, color:GRAY
         }});
 
@@ -526,13 +766,38 @@ DATA.channels.forEach(m => {{
         }});
         s.addText(DATA.period_label, {{ x:0.5, y:1.1, w:SLIDE_W-0.7, h:0.3, fontSize:12, color:GRAY }});
 
-        // Активность (bar chart)
-        const act_labels = ["Посты","Сторис","Реакции","Комменты","Пересылки","Действия"];
+        // Активность (сгруппированный bar chart: текущий месяц vs предыдущий)
+        const act_labels = ["Посты","Сторис","Реакции","Репосты","Комменты","Действия"];
         const act_values = [
             m.posts_count||0, m.stories_count||0, m.total_react||0,
-            m.total_comments||0, m.total_fwd||0, m.total_actions||0
+            m.total_fwd||0, m.total_comments||0, m.total_actions||0
         ];
-        barChart(s, 0.5, 1.6, 6.0, 4.0, act_labels, act_values, [color], "Активность и реакции аудитории");
+        const prevA = m.prev_activity || {{}};
+        const prev_values = [
+            prevA.posts_count||0, prevA.stories_count||0, prevA.total_react||0,
+            prevA.total_fwd||0, prevA.total_comments||0, prevA.total_actions||0
+        ];
+        const avg5A = m.avg5_activity || {{}};
+        const avg5_values = [
+            avg5A.posts_count||0, avg5A.stories_count||0, avg5A.total_react||0,
+            avg5A.total_fwd||0, avg5A.total_comments||0, avg5A.total_actions||0
+        ];
+        groupedBarChart(s, 0.5, 1.6, 6.0, 4.0, act_labels, [
+            {{ name: DATA.month_label,                  values: act_values,  color: color }},
+            {{ name: m.prev_month_label || "Пред. месяц", values: prev_values, color: "D9D9D9" }},
+            {{ name: "Средн. 5 мес.",                    values: avg5_values, color: "8EA9DB" }},
+        ], "Активность и реакции аудитории");
+
+        // Короткий текстовый вывод под графиком — автоматически
+        // формируется в Python (см. build_activity_summary_text), здесь
+        // только отображается.
+        if (m.activity_summary) {{
+            s.addText(m.activity_summary, {{
+                x:0.5, y:5.68, w:6.0, h:1.45,
+                fontSize:8.5, color:"333333", align:"left", valign:"top",
+                lineSpacingMultiple: 1.15,
+            }});
+        }}
 
         // Метрики справа
         const metrics2 = [
@@ -554,11 +819,11 @@ DATA.channels.forEach(m => {{
         // Расшифровка всех показателей (не только VRpost) — под сеткой метрик
         const metricsRows = Math.ceil(metrics2.length/2);
         const legendItems = [
-            ["ER (ERR %)",   "доля аудитории, которая взаимодействует с контентом"],
-            ["VRpost",       "доля аудитории, которая увидела публикацию"],
-            ["Viral Factor", "показатель распространения контента за пределы основной аудитории"],
-            ["Reply Rate",   "доля аудитории, которая отвечает или вступает в диалог"],
-            ["Reach Mult.",  "во сколько раз фактический охват отличается от базовой аудитории"],
+            ["ER (ERR %) ≥ 2%",     "доля аудитории, которая взаимодействует с контентом"],
+            ["VRpost ≥ 20%",        "доля аудитории, которая увидела публикацию"],
+            ["Viral Factor ≥ 1.2",  "показатель распространения контента за пределы основной аудитории"],
+            ["Reply Rate ≥ 10%",    "доля аудитории, которая отвечает или вступает в диалог"],
+            ["Reach Mult. ≥ 1.3x",  "во сколько раз фактический охват отличается от базовой аудитории"],
         ];
         const legendY0 = my0 + metricsRows*(mh+mgap) + 0.08;
         legendItems.forEach((item, i) => {{
@@ -593,11 +858,12 @@ DATA.channels.forEach(m => {{
             {{ title:"Лучший по охвату",    data: bw_data.best_reach }},
             {{ title:"Лучший по реакциям",  data: bw_data.best_react }},
             {{ title:"Лучший по ER",        data: bw_data.best_er }},
+            {{ title:"Лучший по репостам",  data: bw_data.best_forwards }},
         ];
         // Порядок в карточке строго: Дата·Тип → Охват·ER·Реакции → Ссылка/Открыть → текст поста (post_preview)
-        const cw = 4.1;
+        const cw = 3.0;
         bests.forEach((b, i) => {{
-            const x = 0.5 + i*(cw+0.1);
+            const x = 0.5 + i*(cw+0.08);
             s.addShape(pres.shapes.ROUNDED_RECTANGLE, {{ x, y:1.55, w:cw, h:1.95, rectRadius:0.08, fill:{{ color:"F4F6FB" }} }});
             s.addText(b.title, {{ x, y:1.6, w:cw, h:0.28, align:"center", fontSize:10, bold:true, color:NAVY }});
             if (b.data) {{
@@ -653,77 +919,20 @@ DATA.channels.forEach(m => {{
 
     // ── СЛАЙД D: Платные посевы (только если есть данные) ─────────────────
     if (paid_ch && paid_ch.length > 0) {{
-        const s = pres.addSlide();
-        s.addShape(pres.shapes.RECTANGLE, {{ x:0, y:0, w:0.18, h:SLIDE_H, fill:{{ color }} }});
-        kicker(s, name + " · платные размещения");
-        s.addText(name + ": платные посевы", {{
-            x:0.5, y:0.45, w:SLIDE_W-0.7, h:0.65, fontSize:22, bold:true, color:NAVY
-        }});
-        s.addText(DATA.period_label, {{ x:0.5, y:1.1, w:SLIDE_W-0.7, h:0.3, fontSize:12, color:GRAY }});
+        renderPaidSlide(name, color, paid_ch);
+    }}
+}});
 
-        // Агрегаты
-        const total_budget = paid_ch.reduce((a,p) => a+(p.budget||0), 0);
-        const total_reach  = paid_ch.reduce((a,p) => a+(p.reach||0), 0);
-        const total_inflow = paid_ch.reduce((a,p) => a+(p.inflow||0), 0);
-        const avg_cpv      = total_reach  ? Math.round(total_budget/total_reach*100)/100 : null;
-        const avg_cpf      = total_inflow ? Math.round(total_budget/total_inflow*100)/100 : null;
-
-        const bullets = [
-            "Размещений: " + paid_ch.length,
-            "Бюджет: " + (total_budget ? total_budget.toLocaleString("ru")+" ₽" : "—"),
-            "Охват: " + (total_reach  ? total_reach.toLocaleString("ru") : "—"),
-            "Приток: " + (total_inflow ? total_inflow.toLocaleString("ru") : "—"),
-            "Средний CPV: " + (avg_cpv  ? avg_cpv+" ₽"  : "—"),
-            "Средний CPF: " + (avg_cpf  ? avg_cpf+" ₽"  : "—"),
-        ];
-        s.addText(bullets.join("   ·   "), {{
-            x:0.5, y:1.5, w:SLIDE_W-0.7, h:0.35,
-            fontSize:11, color:NAVY, bold:false
-        }});
-
-        // Два графика
-        const plat_names   = paid_ch.map(p => p.platform);
-        const reach_vals   = paid_ch.map(p => p.reach  || 0);
-        const cpf_vals     = paid_ch.map(p => p.cpf    || 0);
-
-        if (paid_ch.length > 1) {{
-            hBarChart(s, 0.5, 2.0, 5.8, 2.8, plat_names, reach_vals, color, "Охват по размещениям");
-            hBarChart(s, 6.9, 2.0, 5.8, 2.8, plat_names, cpf_vals,   color, "CPF по размещениям, ₽");
-        }}
-
-        // Таблица
-        const tby = 4.95;
-        const cols = ["Площадка","Дата","Стоимость","Охват","Приток","CPV","CPF"];
-        const colW2 = [3.5, 1.3, 1.5, 1.2, 1.2, 1.2, 1.2];
-        let tx = 0.5;
-        cols.forEach((c, i) => {{
-            s.addShape(pres.shapes.RECTANGLE, {{ x:tx, y:tby, w:colW2[i], h:0.3, fill:{{ color:"1F3864" }} }});
-            s.addText(c, {{ x:tx, y:tby, w:colW2[i], h:0.3, align:"center", fontSize:8, bold:true, color:WHITE }});
-            tx += colW2[i];
-        }});
-        paid_ch.forEach((p, ri) => {{
-            let tx2 = 0.5;
-            const row_y = tby + 0.3 + ri*0.28;
-            const bg2   = ri%2 === 0 ? "FFFFFF" : "F4F6FB";
-            const vals2 = [
-                p.platform,
-                fmtDate(p.date),
-                p.budget ? p.budget.toLocaleString("ru")+" ₽" : "—",
-                p.reach  ? p.reach.toLocaleString("ru") : "—",
-                p.inflow ? p.inflow.toLocaleString("ru") : "—",
-                p.cpv    ? p.cpv+" ₽"  : "—",
-                p.cpf    ? p.cpf+" ₽"  : "—",
-            ];
-            vals2.forEach((v, i) => {{
-                s.addShape(pres.shapes.RECTANGLE, {{ x:tx2, y:row_y, w:colW2[i], h:0.27, fill:{{ color:bg2 }} }});
-                s.addText(String(v), {{ x:tx2, y:row_y, w:colW2[i], h:0.27, align: i===0?"left":"center", fontSize:8, color:GRAY, margin:3 }});
-                tx2 += colW2[i];
-            }});
-        }});
-
-        footer(s);
-        s.addText(String(slideNum).padStart(2,"0"), {{ x:SLIDE_W-0.8, y:SLIDE_H-0.4, w:0.5, h:0.3, fontSize:10, color:GRAY, align:"right" }});
-        slideNum++;
+// ════════ ДОПОЛНИТЕЛЬНЫЕ БЛОКИ ПЛАТНЫХ РАЗМЕЩЕНИЙ ════════════════════════
+// Разделы таблицы посевов, чьё название не совпало ни с одним из ваших
+// каналов (например "HRTech") — не привязываются к случайному каналу и
+// не теряются молча, а получают СОБСТВЕННЫЙ слайд в самом конце
+// презентации, по одному на каждое такое название.
+const EXTRA_PAID_COLOR = "5B8DEF";
+Object.keys(DATA.extra_paid || {{}}).forEach(name => {{
+    const paid_ch = DATA.extra_paid[name] || [];
+    if (paid_ch.length > 0) {{
+        renderPaidSlide(name, EXTRA_PAID_COLOR, paid_ch);
     }}
 }});
 
@@ -745,7 +954,7 @@ async def build_dashboard(client, ym: str, date_from: date, date_to: date,
                         RECIPIENT_IDS)
     from history_db import ensure_seeded, get_all_channels_history
     from dashboard_metrics import (build_channel_metrics, build_global_metrics)
-    from paid_placements import get_paid_placements
+    from paid_placements import get_paid_placements, get_extra_paid_groups
 
     ensure_seeded()
 
@@ -785,6 +994,13 @@ async def build_dashboard(client, ym: str, date_from: date, date_to: date,
     # Данные по каналам
     channel_metrics  = []
     paid_data        = {}
+
+    # Для сравнения на графике "Активность и реакции аудитории" —
+    # предыдущий календарный месяц (для отчёта за август — июль и т.д.)
+    _prev_year, _prev_month = (year_n, month_n - 1) if month_n > 1 else (year_n - 1, 12)
+    from calendar import monthrange as _monthrange
+    prev_d_from = date(_prev_year, _prev_month, 1)
+    prev_d_to   = date(_prev_year, _prev_month, _monthrange(_prev_year, _prev_month)[1])
 
     for ch in CHANNELS:
         # Посты — сначала 24ч срезы, остальное историческое
@@ -845,6 +1061,100 @@ async def build_dashboard(client, ym: str, date_from: date, date_to: date,
 
         channel_metrics.append(metrics)
 
+        # Активность за ПРЕДЫДУЩИЙ месяц — для сравнения на графике
+        # "Активность и реакции аудитории" (светло-серые столбцы рядом с
+        # текущими). Данные не берём из history_db.json (там таких
+        # разрезов нет, только агрегаты avg_reach/err/vrpost) — считаем
+        # напрямую из кэша, точно так же, как для текущего месяца.
+        prev_final = get_final_posts_for_period(ch, prev_d_from, prev_d_to)
+        prev_hist_posts, _prev_subs = await hist_mod.get_posts_for_period(
+            client, ch, prev_d_from, prev_d_to, force=False)
+        prev_by_id = {str(p["msg_id"]): p for p in prev_hist_posts}
+        for mid, fp in prev_final.items():
+            if mid in prev_by_id:
+                prev_by_id[mid]["snapshot"] = fp["snapshot"]
+            else:
+                prev_by_id[mid] = fp
+        prev_posts = list(prev_by_id.values())
+        prev_stories = stories_mod.get_stories_for_period(ch, prev_d_from, prev_d_to)
+
+        prev_react = sum((p.get("snapshot") or {}).get("reactions", 0) or 0 for p in prev_posts)
+        prev_fwd   = sum((p.get("snapshot") or {}).get("forwards", 0)  or 0 for p in prev_posts)
+        prev_comm  = sum((p.get("snapshot") or {}).get("comments", 0)  or 0 for p in prev_posts)
+        prev_act   = sum((p.get("snapshot") or {}).get("actions", 0)   or 0 for p in prev_posts)
+
+        metrics["prev_month_label"] = f"{MONTHS_RU.get(_prev_month,'')} {_prev_year}"
+        metrics["prev_activity"] = {
+            "posts_count":   len(prev_posts),
+            "stories_count": len(prev_stories),
+            "total_react":   prev_react,
+            "total_fwd":     prev_fwd,
+            "total_comments":prev_comm,
+            "total_actions": prev_act,
+        }
+
+        # Среднее за 5 месяцев ДО текущего (для августа — март-июль
+        # включительно). Сохраняем данные ПО КАЖДОМУ месяцу отдельно
+        # (month_activities) — нужно для текстового вывода под графиком:
+        # там среднее считается как "среднее из показателей НА ПОСТ по
+        # каждому месяцу", а не "сумма за 5 месяцев / сумма постов" —
+        # это разные числа (см. приложенное ТЗ, п.5).
+        month_activities = [{
+            "posts_count":    len(prev_posts),
+            "stories_count":  len(prev_stories),
+            "total_react":    prev_react,
+            "total_fwd":      prev_fwd,
+            "total_comments": prev_comm,
+            "total_actions":  prev_act,
+        }]
+        _ay, _am = _prev_year, _prev_month
+        for _ in range(4):  # ещё 4 месяца назад от "предыдущего" (итого 5)
+            if _am == 1:
+                _ay, _am = _ay - 1, 12
+            else:
+                _am -= 1
+            _a_from = date(_ay, _am, 1)
+            _a_to   = date(_ay, _am, _monthrange(_ay, _am)[1])
+            _a_final = get_final_posts_for_period(ch, _a_from, _a_to)
+            _a_hist, _ = await hist_mod.get_posts_for_period(client, ch, _a_from, _a_to, force=False)
+            _a_by_id = {str(p["msg_id"]): p for p in _a_hist}
+            for mid, fp in _a_final.items():
+                if mid in _a_by_id:
+                    _a_by_id[mid]["snapshot"] = fp["snapshot"]
+                else:
+                    _a_by_id[mid] = fp
+            _a_posts = list(_a_by_id.values())
+            _a_stories = stories_mod.get_stories_for_period(ch, _a_from, _a_to)
+
+            month_activities.append({
+                "posts_count":    len(_a_posts),
+                "stories_count":  len(_a_stories),
+                "total_react":    sum((p.get("snapshot") or {}).get("reactions", 0) or 0 for p in _a_posts),
+                "total_fwd":      sum((p.get("snapshot") or {}).get("forwards", 0)  or 0 for p in _a_posts),
+                "total_comments": sum((p.get("snapshot") or {}).get("comments", 0)  or 0 for p in _a_posts),
+                "total_actions":  sum((p.get("snapshot") or {}).get("actions", 0)   or 0 for p in _a_posts),
+            })
+
+        # Для графика (суммы, делённые на 5 — простое среднее по объёму)
+        metrics["avg5_activity"] = {
+            k: round(sum(m[k] for m in month_activities) / 5, 1)
+            for k in ("posts_count","stories_count","total_react","total_fwd","total_comments","total_actions")
+        }
+
+        # Текстовый вывод под графиком — отдельная методика (см. ТЗ):
+        # среднее считается из показателей "на публикацию" по каждому
+        # месяцу, а не из суммы за 5 месяцев.
+        metrics["activity_summary"] = build_activity_summary_text(
+            month_n,
+            metrics.get("posts_count", 0),
+            metrics.get("total_react", 0),
+            metrics.get("total_comments", 0),
+            metrics.get("total_fwd", 0),
+            metrics.get("total_actions", 0),
+            month_activities,
+        )
+
+
         # Платные размещения
         paid_data[ch] = get_paid_placements(ch, date_from, date_to)
 
@@ -877,6 +1187,7 @@ async def build_dashboard(client, ym: str, date_from: date, date_to: date,
         "history":         history,
         "history_data":    history_for_js,
         "paid":            {ch: paid_data.get(ch, []) for ch in CHANNELS},
+        "extra_paid":      get_extra_paid_groups(date_from, date_to),
         "month_label":     month_label,
         "title_month_name":title_month_name,
         "title_year":      year_n,
