@@ -37,6 +37,7 @@ import snapshot as snap
 import historical as hist
 import stories as stories_mod
 import dashboard_report as dash_rep
+import import_paid_placements as paid_import
 
 WEEKLY_DAY  = 0   # понедельник
 MONTHLY_DAY = 3   # 3-е число
@@ -221,36 +222,71 @@ async def tick(client: TelegramClient):
             log.error(f"Ошибка недельного отчёта: {e}", exc_info=DEBUG_MODE)
 
     # ── Месячный отчёт (3-е число) ───────────────────────────────────────
+    # Запись в history_db.json теперь делает report.build_and_send() сам
+    # (см. report.py) — отдельный дублирующий вызов здесь раньше
+    # использовал только registry.json (get_final_posts_for_period), без
+    # базового полного списка постов из historical.py, и мог перезаписать
+    # верные avg_reach/err/vrpost на менее полные, если snapshot.py что-то
+    # не успел зарегистрировать.
     if (today.day == MONTHLY_DAY and _last_monthly != today):
         try:
             await run_report(client, "monthly", override_recipients=RECIPIENT_IDS)
             _last_monthly = today
-            # Записываем историю после месячного отчёта
-            try:
-                from history_db import record_month_from_report
-                ym = (today.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
-                # Данные возьмём из реестра
-                from registry_manager import get_final_posts_for_period, load_registry
-                from calendar import monthrange as _mr
-                year, month = int(ym[:4]), int(ym[5:7])
-                d_from = date(year, month, 1)
-                d_to   = date(year, month, _mr(year, month)[1])
-                cdata = []
-                for ch in CHANNELS:
-                    reg   = load_registry(ch)
-                    subs  = reg.get("subscribers", 0)
-                    posts = list(get_final_posts_for_period(ch, d_from, d_to).values())
-                    cdata.append({"channel_id": ch, "subscribers": subs, "posts": posts})
-                record_month_from_report(ym, cdata)
-            except Exception as e:
-                log.warning(f"Ошибка записи истории: {e}")
         except Exception as e:
             log.error(f"Ошибка месячного отчёта: {e}", exc_info=DEBUG_MODE)
 
 
 # ── Обработчики команд ────────────────────────────────────────────────────
 
+async def _present_paid_analysis(event, sender_id: int, rows: list, year_hint: int = None):
+    """
+    Общий для двух точек входа (сразу после загрузки файла и после
+    выбора листа) шаг: разобрать строки и показать сводку с вопросом
+    на подтверждение — то же самое, что делает консольный скрипт, но
+    ответом в Telegram вместо input().
+    """
+    analysis = paid_import.analyze_rows(rows, year_hint)
+
+    if not analysis["summary_lines"] and not analysis["unmatched"]:
+        _dialog_state.pop(sender_id, None)
+        await event.reply("Не нашёл ни одной строки с размещениями. Проверьте структуру файла.")
+        return
+
+    summary_text = paid_import.format_summary_text(analysis)
+
+    if analysis["total_new"] == 0:
+        _dialog_state.pop(sender_id, None)
+        await event.reply(
+            f"Найдено размещений:\n\n{summary_text}\n\n"
+            f"Новых размещений для добавления нет (всё уже есть в базе)."
+        )
+        return
+
+    _dialog_state[sender_id] = {
+        "state": "awaiting_paid_confirm",
+        "plan":  analysis["plan"],
+    }
+    await event.reply(
+        f"Найдено размещений:\n\n{summary_text}\n\n"
+        f"Добавить {analysis['total_new']} новых размещений в базу?\n\n"
+        f"1 — да\n2 — нет"
+    )
+
+
 def register_command_handler(client: TelegramClient):
+
+    @client.on(events.NewMessage(pattern=r"^/import_paid$", incoming=True))
+    async def handle_import_paid(event):
+        sender_id = event.sender_id
+        if sender_id not in ALLOWED_SENDERS:
+            return
+        log.info(f"Команда /import_paid от {sender_id}")
+        _dialog_state[sender_id] = {"state": "awaiting_paid_file"}
+        await event.reply(
+            "📎 Пришлите файл с посевами (.xlsx или .csv) — файлом, с подписью или без.\n"
+            "Формат — тот же, что в Google Таблице (заголовки-разделы каналов, "
+            "колонки Площадка/Ссылка/Дата/...)."
+        )
 
     @client.on(events.NewMessage(pattern=r"^/report", incoming=True))
     async def handle_report(event):
@@ -314,7 +350,8 @@ def register_command_handler(client: TelegramClient):
                 "/report monthly    — месячный отчёт\n"
                 "/report dashboard  — управленческий дашборд (PPTX)\n"
                 "/upload monthly    — выгрузить месяц в Google Sheets\n"
-                "/backfill          — ретро-сбор исторических данных"
+                "/backfill          — ретро-сбор исторических данных\n"
+                "/import_paid       — загрузить платные размещения из файла"
             )
 
     @client.on(events.NewMessage(pattern=r"^/upload", incoming=True))
@@ -412,6 +449,38 @@ def register_command_handler(client: TelegramClient):
 
         text  = event.raw_text.strip()
         state = state_data.get("state")
+
+        # ── Приём файла с посевами (может прийти без подписи-текста,
+        # поэтому обрабатывается раньше текстовых веток) ─────────────────
+        if state == "awaiting_paid_file":
+            if not event.document:
+                await event.reply("⚠️ Это должен быть файл (.xlsx или .csv), не текст.")
+                return
+            import tempfile
+            orig_name = (event.file.name or "paid_import.xlsx") if event.file else "paid_import.xlsx"
+            suffix = Path(orig_name).suffix or ".xlsx"
+            tmp_path = Path(tempfile.gettempdir()) / f"paid_import_{sender_id}{suffix}"
+            await event.download_media(file=str(tmp_path))
+            log.info(f"/import_paid: получен файл от {sender_id} -> {tmp_path}")
+
+            try:
+                rows, year_hint = paid_import.read_file_rows(tmp_path)
+            except paid_import.MultipleSheetsError as e:
+                _dialog_state[sender_id] = {
+                    "state": "awaiting_paid_sheet",
+                    "file_path": str(tmp_path),
+                    "sheetnames": e.sheetnames,
+                }
+                sheets_list = "\n".join(f"{i+1}. {name}" for i, name in enumerate(e.sheetnames))
+                await event.reply(f"В файле несколько листов, укажите номер нужного:\n\n{sheets_list}")
+                return
+            except Exception as e:
+                del _dialog_state[sender_id]
+                await event.reply(f"❌ Не смог прочитать файл: {e}")
+                return
+
+            await _present_paid_analysis(event, sender_id, rows, year_hint)
+            return
 
         MONTH_NAMES = {
             "01":"январь","02":"февраль","03":"март","04":"апрель",
@@ -662,6 +731,36 @@ def register_command_handler(client: TelegramClient):
                 await event.reply(f"✅ Данные за {mon.strftime('%d.%m')}–{sun.strftime('%d.%m.%Y')} сохранены.")
             except Exception as e:
                 await event.reply(f"❌ Ошибка: {e}")
+
+        # ── Импорт посевов: выбор листа (если их несколько в файле) ──────
+        elif state == "awaiting_paid_sheet":
+            sheetnames = state_data["sheetnames"]
+            if not text.isdigit() or not (1 <= int(text) <= len(sheetnames)):
+                await event.reply(f"⚠️ Введите число от 1 до {len(sheetnames)}")
+                return
+            sheet_name = sheetnames[int(text) - 1]
+            file_path  = Path(state_data["file_path"])
+            try:
+                rows, year_hint = paid_import.read_file_rows(file_path, sheet_name)
+            except Exception as e:
+                del _dialog_state[sender_id]
+                await event.reply(f"❌ Ошибка: {e}")
+                return
+            await _present_paid_analysis(event, sender_id, rows, year_hint)
+
+        # ── Импорт посевов: подтверждение записи ──────────────────────────
+        elif state == "awaiting_paid_confirm":
+            if text == "1":
+                plan = state_data["plan"]
+                del _dialog_state[sender_id]
+                total = paid_import.apply_plan(plan)
+                log.info(f"/import_paid: {sender_id} подтвердил запись, добавлено {total}")
+                await event.reply(f"✅ Готово — добавлено размещений: {total}.")
+            elif text == "2":
+                del _dialog_state[sender_id]
+                await event.reply("Отменено, ничего не записано.")
+            else:
+                await event.reply("⚠️ Введите 1 или 2")
 
 
 # ── Главный цикл ──────────────────────────────────────────────────────────

@@ -259,7 +259,19 @@ def save_local_placements(data: dict):
 
 # ── Google Sheets ──────────────────────────────────────────────────────────
 
-def _fetch_google_rows() -> list | None:
+def _fetch_google_rows(month_label: str = None) -> list | None:
+    """
+    Читает строки нужного листа Google-таблицы с посевами.
+
+    Ваша таблица устроена как одна вкладка на месяц ("Март 2026",
+    "Июнь 2026", "Август 2026" — та же схема именования, что и в
+    google_sheets.py для месячных Excel-отчётов), актуальная вкладка
+    может быть в любом месте по порядку — поэтому берём ЛИСТ ПО ИМЕНИ,
+    соответствующему запрошенному месяцу, а не "первый попавшийся".
+
+    Если month_label не передан (обратная совместимость) — берётся
+    первый лист, как раньше.
+    """
     url = _get_sheet_url()
     if not url:
         return None
@@ -279,7 +291,19 @@ def _fetch_google_rows() -> list | None:
         creds       = Credentials.from_service_account_file(creds_path, scopes=scopes)
         gc          = gspread.authorize(creds)
         spreadsheet = gc.open_by_url(url)
-        ws          = spreadsheet.sheet1
+
+        if month_label:
+            try:
+                ws = spreadsheet.worksheet(month_label)
+            except gspread.exceptions.WorksheetNotFound:
+                available = [w.title for w in spreadsheet.worksheets()]
+                log.warning(f"В Google Sheets с посевами нет листа '{month_label}' "
+                            f"(доступные листы: {available}) — платные размещения "
+                            f"за этот месяц пропущены")
+                return None
+        else:
+            ws = spreadsheet.sheet1
+
         return ws.get_all_values()
     except Exception as e:
         log.error(f"Ошибка чтения платных размещений из Google Sheets: {e}")
@@ -295,17 +319,18 @@ def get_paid_placements(channel: str, date_from, date_to) -> list[dict]:
     через import_paid_placements.py. Источники дополняют друг друга, не
     заменяют один другой.
     """
-    from config import DASHBOARD_CHANNELS
+    from config import DASHBOARD_CHANNELS, MONTHS_RU
     channels_config = DASHBOARD_CHANNELS
 
     df_str = date_from.strftime("%Y-%m-%d")
     dt_str = date_to.strftime("%Y-%m-%d")
     year_hint = date_from.year
+    month_label = f"{MONTHS_RU.get(date_from.month,'')} {date_from.year}"
 
     result = []
 
-    # 1. Google Sheets
-    rows = _fetch_google_rows()
+    # 1. Google Sheets — лист с именем нужного месяца ("Август 2026" и т.п.)
+    rows = _fetch_google_rows(month_label)
     if rows and len(rows) >= 2:
         by_key, _ = _parse_rows(rows[1:], channels_config, df_str, dt_str, year_hint)
         result.extend(by_key.get(channel, []))
@@ -330,18 +355,19 @@ def get_extra_paid_groups(date_from, date_to) -> dict:
 
     Возвращает {название_раздела: [placement, ...]}.
     """
-    from config import DASHBOARD_CHANNELS
+    from config import DASHBOARD_CHANNELS, MONTHS_RU
     channels_config = DASHBOARD_CHANNELS
     known_channels = set(channels_config.keys())
 
     df_str = date_from.strftime("%Y-%m-%d")
     dt_str = date_to.strftime("%Y-%m-%d")
     year_hint = date_from.year
+    month_label = f"{MONTHS_RU.get(date_from.month,'')} {date_from.year}"
 
     result: dict = {}
 
-    # 1. Google Sheets
-    rows = _fetch_google_rows()
+    # 1. Google Sheets — лист с именем нужного месяца
+    rows = _fetch_google_rows(month_label)
     if rows and len(rows) >= 2:
         by_key, extra_headers = _parse_rows(rows[1:], channels_config, df_str, dt_str, year_hint)
         for name in extra_headers:
