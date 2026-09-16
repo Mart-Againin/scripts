@@ -65,49 +65,34 @@ def build_activity_summary_text(month_num: int,
                                  month_activities: list) -> str | None:
     """
     Короткий текстовый вывод под графиком "Активность и реакции
-    аудитории" — по алгоритму из ТЗ (сравнение текущего месяца со
-    средним за предыдущие 5 полных месяцев).
+    аудитории" — сравнение СУММАРНЫХ показателей текущего месяца со
+    средним суммарным за предыдущие 5 полных месяцев (без деления на
+    количество публикаций — так попросили сравнивать).
 
     month_activities — список из 5 dict {posts_count, total_react,
     total_comments, total_fwd, total_actions} за предыдущие 5 месяцев
     (не обязательно в каком-то порядке).
 
-    Возвращает None, если сравнивать не с чем (0 постов в текущем
-    месяце, либо во всех 5 предыдущих сразу).
+    Возвращает None, если сравнивать не с чем (нет ни одного из 5
+    предыдущих месяцев).
     """
-    if not posts_current:
+    if not month_activities:
         return None
 
-    reactions_per_post_current = reactions_current / posts_current
-    comments_per_post_current  = comments_current  / posts_current
-    forwards_per_post_current  = forwards_current  / posts_current
-    actions_per_post_current   = actions_current   / posts_current
-
-    # Месяцы с 0 постов исключаются из среднего "на публикацию" (иначе
-    # деление на 0), но не из avg_posts — там 0 постов - валидное число.
-    valid_months = [m for m in month_activities if m.get("posts_count")]
-    if not valid_months:
-        return None
-
-    avg_posts = sum(m.get("posts_count", 0) for m in month_activities) / len(month_activities)
-
-    def _avg_per_post(key):
-        vals = [m[key] / m["posts_count"] for m in valid_months]
-        return sum(vals) / len(vals)
-
-    avg_reactions_per_post = _avg_per_post("total_react")
-    avg_comments_per_post  = _avg_per_post("total_comments")
-    avg_forwards_per_post  = _avg_per_post("total_fwd")
-    avg_actions_per_post   = _avg_per_post("total_actions")
+    avg_posts     = sum(m.get("posts_count", 0)    for m in month_activities) / len(month_activities)
+    avg_reactions = sum(m.get("total_react", 0)     for m in month_activities) / len(month_activities)
+    avg_comments  = sum(m.get("total_comments", 0)  for m in month_activities) / len(month_activities)
+    avg_forwards  = sum(m.get("total_fwd", 0)        for m in month_activities) / len(month_activities)
+    avg_actions   = sum(m.get("total_actions", 0)    for m in month_activities) / len(month_activities)
 
     def _delta(curr, avg):
         return (curr - avg) / avg * 100 if avg else None
 
     posts_delta     = _delta(posts_current, avg_posts)
-    reactions_delta = _delta(reactions_per_post_current, avg_reactions_per_post)
-    comments_delta  = _delta(comments_per_post_current,  avg_comments_per_post)
-    forwards_delta  = _delta(forwards_per_post_current,  avg_forwards_per_post)
-    actions_delta   = _delta(actions_per_post_current,   avg_actions_per_post)
+    reactions_delta = _delta(reactions_current, avg_reactions)
+    comments_delta  = _delta(comments_current,  avg_comments)
+    forwards_delta  = _delta(forwards_current,  avg_forwards)
+    actions_delta   = _delta(actions_current,   avg_actions)
 
     posts_status     = _delta_status(posts_delta)
     actions_status   = _delta_status(actions_delta)
@@ -125,17 +110,15 @@ def build_activity_summary_text(month_num: int,
     else:
         s1 = f"В {month_word} количество публикаций осталось примерно на уровне среднего за предыдущие 5 месяцев."
 
-    # Б. Действия на публикацию
+    # Б. Действия — суммарно за месяц, без деления на число публикаций
     if actions_status == "up":
-        s2 = f"Количество действий на одну публикацию выросло на {round(abs(actions_delta))}%."
+        s2 = f"Общее количество действий выросло на {round(abs(actions_delta))}% по сравнению со средним за предыдущие 5 месяцев."
     elif actions_status == "down":
-        s2 = f"Количество действий на одну публикацию снизилось на {round(abs(actions_delta))}%."
+        s2 = f"Общее количество действий снизилось на {round(abs(actions_delta))}% по сравнению со средним за предыдущие 5 месяцев."
     else:
-        s2 = "Количество действий на одну публикацию осталось примерно на среднем уровне."
+        s2 = "Общее количество действий осталось примерно на среднем уровне."
 
-    # В. Реакции / Комментарии / Репосты (в ТЗ — "пересылки"; в остальном
-    # документе термин уже заменён на "репосты" — используем его для
-    # единообразия)
+    # В. Реакции / Комментарии / Репосты — тоже суммарно
     def _phrase(status, delta, verb_word, stable_text):
         if status == "up":
             return f"{verb_word} на {round(abs(delta))}% больше"
@@ -144,10 +127,10 @@ def build_activity_summary_text(month_num: int,
         return stable_text
 
     react_phrase = _phrase(reactions_status, reactions_delta,
-                            "реакций на публикацию стало",
-                            "реакции на публикацию остались примерно на среднем уровне")
+                            "реакций стало",
+                            "реакции остались примерно на среднем уровне")
     comments_phrase = _phrase(comments_status, comments_delta,
-                               "комментариев на публикацию стало",
+                               "комментариев стало",
                                "комментарии остались примерно на среднем уровне")
     forwards_phrase = _phrase(forwards_status, forwards_delta,
                                "репостов стало",
@@ -155,20 +138,20 @@ def build_activity_summary_text(month_num: int,
 
     s3 = f"{react_phrase[0].upper()}{react_phrase[1:]}, {comments_phrase}, а {forwards_phrase}."
 
-    # Г. Итоговая интерпретация — в первую очередь по actions_per_post;
-    # если объём контента (posts) тоже заметно изменился — уточняем.
+    # Г. Итоговая интерпретация — по суммарной активности, а не по
+    # эффективности отдельной публикации (раз считаем теперь суммарно).
     if actions_status == "stable":
-        s4 = "В целом эффективность публикаций сохранилась на уровне предыдущих месяцев."
+        s4 = "В целом активность аудитории осталась на уровне предыдущих месяцев."
     elif posts_status == "down" and actions_status == "up":
-        s4 = "Несмотря на меньший объём контента, аудитория взаимодействовала с публикациями активнее."
+        s4 = "Несмотря на меньший объём контента, суммарная активность аудитории оказалась выше обычного."
     elif posts_status == "up" and actions_status == "up":
-        s4 = "Рост объёма контента сопровождался ростом активности аудитории."
+        s4 = "Рост объёма контента сопровождался ростом суммарной активности аудитории."
     elif posts_status == "up" and actions_status == "down":
-        s4 = "Публикаций стало больше, однако эффективность каждой отдельной публикации снизилась."
+        s4 = "Публикаций стало больше, однако суммарная активность аудитории снизилась."
     elif posts_status == "down" and actions_status == "down":
         s4 = "Снижение объёма контента сопровождалось снижением активности аудитории."
     elif posts_status == "stable" and actions_status == "up":
-        s4 = "При сопоставимом объёме контента аудитория взаимодействовала с публикациями активнее."
+        s4 = "При сопоставимом объёме контента активность аудитории была выше обычного."
     else:  # posts_status == "stable" and actions_status == "down"
         s4 = "При сопоставимом объёме контента активность аудитории снизилась."
 
@@ -496,8 +479,27 @@ function hBarChart(slide, x, y, w, h, labels, values, color, chartTitle) {{
 // таблицы посевов, чьё название не совпало ни с одним каналом (см. цикл
 // по DATA.extra_paid ниже) — там вместо названия канала просто
 // подставляется название раздела как есть.
+function paidKpiCard(slide, x, y, w, h, label, value, color) {{
+    slide.addShape(pres.shapes.ROUNDED_RECTANGLE, {{
+        x, y, w, h, rectRadius:0.06,
+        fill:{{ color:"FFFFFF" }}, line:{{ color:"E6E6EA", width:1 }},
+    }});
+    // акцентная полоса слева, в цвете канала
+    slide.addShape(pres.shapes.RECTANGLE, {{ x, y:y+0.07, w:0.06, h:h-0.14, fill:{{ color }} }});
+    slide.addText(label, {{
+        x:x+0.2, y:y+0.13, w:w-0.32, h:0.24,
+        fontSize:8, bold:true, color:GRAY, align:"left",
+    }});
+    slide.addText(String(value), {{
+        x:x+0.2, y:y+0.4, w:w-0.32, h:h-0.5,
+        fontSize:17, bold:true, color:"#"+color, align:"left", valign:"top",
+    }});
+}}
+
 function renderPaidSlide(title, color, paid_ch) {{
     const s = pres.addSlide();
+
+    // ── Шапка — БЕЗ ИЗМЕНЕНИЙ ───────────────────────────────────────────
     s.addShape(pres.shapes.RECTANGLE, {{ x:0, y:0, w:0.18, h:SLIDE_H, fill:{{ color }} }});
     kicker(s, title + " · платные размещения");
     s.addText(title + ": платные посевы", {{
@@ -505,47 +507,62 @@ function renderPaidSlide(title, color, paid_ch) {{
     }});
     s.addText(DATA.period_label, {{ x:0.5, y:1.1, w:SLIDE_W-0.7, h:0.3, fontSize:12, color:GRAY }});
 
+    // ── Агрегаты (расчёты не менялись) ──────────────────────────────────
     const total_budget = paid_ch.reduce((a,p) => a+(p.budget||0), 0);
     const total_reach  = paid_ch.reduce((a,p) => a+(p.reach||0), 0);
     const total_inflow = paid_ch.reduce((a,p) => a+(p.inflow||0), 0);
-    const avg_cpv      = total_reach  ? Math.round(total_budget/total_reach*100)/100 : null;
-    const avg_cpf      = total_inflow ? Math.round(total_budget/total_inflow*100)/100 : null;
+    const avg_cpv       = total_reach  ? Math.round(total_budget/total_reach*100)/100 : null;
+    const avg_cpf       = total_inflow ? Math.round(total_budget/total_inflow*100)/100 : null;
 
-    const bullets = [
-        "Размещений: " + paid_ch.length,
-        "Бюджет: " + (total_budget ? total_budget.toLocaleString("ru")+" ₽" : "—"),
-        "Охват: " + (total_reach  ? total_reach.toLocaleString("ru") : "—"),
-        "Приток: " + (total_inflow ? total_inflow.toLocaleString("ru") : "—"),
-        "Средний CPV: " + (avg_cpv  ? avg_cpv+" ₽"  : "—"),
-        "Средний CPF: " + (avg_cpf  ? avg_cpf+" ₽"  : "—"),
+    const bodyX = 0.5, bodyW = SLIDE_W - 1.0;
+
+    // ── KPI-карточки: один ряд, шесть штук, одинаковый размер ──────────
+    const kpis = [
+        {{ label:"РАЗМЕЩЕНИЙ",  value: paid_ch.length }},
+        {{ label:"БЮДЖЕТ",       value: total_budget ? total_budget.toLocaleString("ru")+" ₽" : "—" }},
+        {{ label:"ОХВАТ",        value: total_reach   ? total_reach.toLocaleString("ru")       : "—" }},
+        {{ label:"СРЕДНИЙ CPV",  value: avg_cpv ? avg_cpv+" ₽" : "—" }},
+        {{ label:"ПРИТОК",       value: total_inflow  ? total_inflow.toLocaleString("ru")      : "—" }},
+        {{ label:"СРЕДНИЙ CPF",  value: avg_cpf ? avg_cpf+" ₽" : "—" }},
     ];
-    s.addText(bullets.join("   ·   "), {{
-        x:0.5, y:1.5, w:SLIDE_W-0.7, h:0.35,
-        fontSize:11, color:NAVY, bold:false
+    const kpiY = 1.6, kpiH = 1.0, kpiGap = 0.15;
+    const kpiW = (bodyW - kpiGap*(kpis.length-1)) / kpis.length;
+    kpis.forEach((k, i) => {{
+        paidKpiCard(s, bodyX + i*(kpiW+kpiGap), kpiY, kpiW, kpiH, k.label, k.value, color);
     }});
 
-    const plat_names = paid_ch.map(p => p.platform);
-    const reach_vals = paid_ch.map(p => p.reach || 0);
-    const cpf_vals   = paid_ch.map(p => p.cpf   || 0);
+    // ── Графики: одна строка, одинаковый размер, выровнены между собой ──
+    const chartsY = kpiY + kpiH + 0.4;
+    const chartsH = 2.3;
+    const chartGap = 0.3;
+    const chartW = (bodyW - chartGap) / 2;
+    const hasCharts = paid_ch.length > 1;
 
-    if (paid_ch.length > 1) {{
-        hBarChart(s, 0.5, 2.0, 5.8, 2.8, plat_names, reach_vals, color, "Охват по размещениям");
-        hBarChart(s, 6.9, 2.0, 5.8, 2.8, plat_names, cpf_vals,   color, "CPF по размещениям, ₽");
+    if (hasCharts) {{
+        const plat_names = paid_ch.map(p => p.platform);
+        const reach_vals = paid_ch.map(p => p.reach || 0);
+        const cpf_vals   = paid_ch.map(p => p.cpf   || 0);
+        hBarChart(s, bodyX, chartsY, chartW, chartsH, plat_names, reach_vals, color, "Охват по размещениям");
+        hBarChart(s, bodyX+chartW+chartGap, chartsY, chartW, chartsH, plat_names, cpf_vals, color, "CPF по размещениям, ₽");
     }}
 
-    const tby = 4.95;
-    const cols  = ["Площадка","Дата","Стоимость","Охват","Приток","CPV","CPF"];
-    const colW2 = [3.5, 1.3, 1.5, 1.2, 1.2, 1.2, 1.2];
-    let tx = 0.5;
+    // ── Таблица: под графиками, во всю ширину, шапка — в цвете канала ──
+    const tableY = hasCharts ? (chartsY + chartsH + 0.3) : chartsY;
+    const cols       = ["Площадка","Дата","Стоимость","Охват","Приток","CPV","CPF"];
+    const colRatios  = [3.5, 1.3, 1.5, 1.2, 1.2, 1.2, 1.2];
+    const ratioSum   = colRatios.reduce((a,b) => a+b, 0);
+    const colW2      = colRatios.map(r => r/ratioSum*bodyW);   // растянуто на всю ширину
+
+    let tx = bodyX;
     cols.forEach((c, i) => {{
-        s.addShape(pres.shapes.RECTANGLE, {{ x:tx, y:tby, w:colW2[i], h:0.3, fill:{{ color:"1F3864" }} }});
-        s.addText(c, {{ x:tx, y:tby, w:colW2[i], h:0.3, align:"center", fontSize:8, bold:true, color:WHITE }});
+        s.addShape(pres.shapes.RECTANGLE, {{ x:tx, y:tableY, w:colW2[i], h:0.32, fill:{{ color }} }});
+        s.addText(c, {{ x:tx, y:tableY, w:colW2[i], h:0.32, align:"center", valign:"middle", fontSize:9, bold:true, color:WHITE }});
         tx += colW2[i];
     }});
     paid_ch.forEach((p, ri) => {{
-        let tx2 = 0.5;
-        const row_y = tby + 0.3 + ri*0.28;
-        const bg2   = ri%2 === 0 ? "FFFFFF" : "F4F6FB";
+        let tx2 = bodyX;
+        const row_y = tableY + 0.32 + ri*0.27;
+        const bg2   = ri%2 === 0 ? "FFFFFF" : "F6F7FA";
         const vals2 = [
             p.platform,
             fmtDate(p.date),
@@ -557,7 +574,7 @@ function renderPaidSlide(title, color, paid_ch) {{
         ];
         vals2.forEach((v, i) => {{
             s.addShape(pres.shapes.RECTANGLE, {{ x:tx2, y:row_y, w:colW2[i], h:0.27, fill:{{ color:bg2 }} }});
-            s.addText(String(v), {{ x:tx2, y:row_y, w:colW2[i], h:0.27, align: i===0?"left":"center", fontSize:8, color:GRAY, margin:3 }});
+            s.addText(String(v), {{ x:tx2, y:row_y, w:colW2[i], h:0.27, align: i===0?"left":"center", valign:"middle", fontSize:8.5, color:"444444", margin:3 }});
             tx2 += colW2[i];
         }});
     }});
