@@ -496,6 +496,25 @@ function paidKpiCard(slide, x, y, w, h, label, value, color) {{
     }});
 }}
 
+// Слайд-обложка блока: название по центру страницы, крупным шрифтом,
+// цветом, присвоенным каналу (или нейтральным для доп. блоков без
+// канала); ниже — период отчёта, мельче. Используется и перед блоком
+// каждого канала, и перед "доп. блоками" платных размещений (если они
+// есть — если нет, обложка для них просто не вызывается).
+function renderCoverSlide(title, color, subtitle) {{
+    const s = pres.addSlide();
+    s.addText(title, {{
+        x:0.6, y:SLIDE_H/2 - 0.7, w:SLIDE_W-1.2, h:1.1,
+        fontSize:40, bold:true, color:"#"+color, align:"center", valign:"middle",
+    }});
+    s.addText(subtitle, {{
+        x:0.6, y:SLIDE_H/2 + 0.45, w:SLIDE_W-1.2, h:0.5,
+        fontSize:16, color:GRAY, align:"center",
+    }});
+    s.addText(String(slideNum).padStart(2,"0"), {{ x:SLIDE_W-0.8, y:SLIDE_H-0.4, w:0.5, h:0.3, fontSize:10, color:GRAY, align:"right" }});
+    slideNum++;
+}}
+
 function renderPaidSlide(title, color, paid_ch) {{
     const s = pres.addSlide();
 
@@ -727,6 +746,10 @@ DATA.channels.forEach(m => {{
     const bw_data = m.best_worst || {{}};
     const paid_ch = DATA.paid[ch] || [];
 
+    // Обложка блока канала — название по центру, цветом канала, ниже
+    // период отчёта.
+    renderCoverSlide(name, color, DATA.month_label);
+
     // Данные истории для этого канала из subs/reach серий
     const ch_idx  = DATA.channels_order.indexOf(ch);
     const ch_subs_hist  = ch_idx >= 0 ? DATA.subs_series[ch_idx]   : null;
@@ -949,6 +972,7 @@ const EXTRA_PAID_COLOR = "5B8DEF";
 Object.keys(DATA.extra_paid || {{}}).forEach(name => {{
     const paid_ch = DATA.extra_paid[name] || [];
     if (paid_ch.length > 0) {{
+        renderCoverSlide(name, EXTRA_PAID_COLOR, DATA.month_label);
         renderPaidSlide(name, EXTRA_PAID_COLOR, paid_ch);
     }}
 }});
@@ -1032,6 +1056,28 @@ async def build_dashboard(client, ym: str, date_from: date, date_to: date,
                 posts_by_id[mid]["snapshot"] = fp["snapshot"]
             else:
                 posts_by_id[mid] = fp
+
+        # Опросы — голосование может продолжаться дольше 24ч/дольше
+        # кэша, поэтому досчитываем актуальные голоса свежим запросом
+        # (та же логика, что в report.py get_channel_posts).
+        poll_ids = [mid for mid, p in posts_by_id.items() if p.get("content_type") == "Опрос"]
+        if poll_ids:
+            try:
+                entity = await client.get_entity(ch)
+                for mid in poll_ids:
+                    try:
+                        msg = await client.get_messages(entity, ids=int(mid))
+                        if msg and msg.media and getattr(msg.media, "results", None) and msg.media.results.results:
+                            fresh_votes = sum(r.voters or 0 for r in msg.media.results.results if r.voters)
+                            sn = posts_by_id[mid].setdefault("snapshot", {})
+                            sn["votes"] = fresh_votes
+                            sn["actions"] = (sn.get("reactions", 0) + sn.get("comments", 0)
+                                              + sn.get("forwards", 0) + fresh_votes)
+                    except Exception as e:
+                        log.warning(f"  [{ch}] не удалось досчитать голоса опроса {mid}: {e}")
+            except Exception as e:
+                log.warning(f"  [{ch}] не удалось получить сущность канала для пересчёта опросов: {e}")
+
         posts = sorted(posts_by_id.values(),
                        key=lambda x: (x.get("date",""), x.get("time","")))
 

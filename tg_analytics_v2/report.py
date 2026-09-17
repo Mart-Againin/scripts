@@ -143,6 +143,14 @@ def lavg(lst):
     vals = [x for x in lst if x is not None]
     return round(sum(vals) / len(vals), 2) if vals else None
 
+def _fmt_date_short(date_str: str) -> str:
+    """ГГГГ-ММ-ДД -> ДД.ММ.ГГ (тот же формат, что и в дашборде)."""
+    if not date_str or len(date_str) != 10 or date_str[4] != "-":
+        return date_str or ""
+    y, m, d = date_str.split("-")
+    return f"{d}.{m}.{y[2:]}"
+
+
 def fv(cell, v, pct=False, flt=False):
     if v is None:
         cell.value = "—"; return
@@ -241,6 +249,34 @@ async def get_channel_posts(client, channel_username: str,
     if replaced:
         log.info(f"  [{channel_username}] 24ч срезов наложено: {replaced}/{len(posts_by_id)}")
 
+    # Шаг 3: опросы — ОСОБЫЙ случай. Голосование может продолжаться
+    # дольше 24 часов (и дольше, чем актуален кэш historical), поэтому
+    # для постов типа "Опрос" не полагаемся ни на 24ч-срез, ни на кэш —
+    # досчитываем АКТУАЛЬНОЕ число голосов свежим точечным запросом
+    # прямо к моменту генерации отчёта (то есть фактически "за весь
+    # месяц на данный момент", а не "за первые сутки").
+    poll_ids = [mid for mid, p in posts_by_id.items() if p.get("content_type") == "Опрос"]
+    if poll_ids:
+        try:
+            entity = await client.get_entity(channel_username)
+            refreshed = 0
+            for mid in poll_ids:
+                try:
+                    msg = await client.get_messages(entity, ids=int(mid))
+                    if msg and msg.media and getattr(msg.media, "results", None) and msg.media.results.results:
+                        fresh_votes = sum(r.voters or 0 for r in msg.media.results.results if r.voters)
+                        sn = posts_by_id[mid].setdefault("snapshot", {})
+                        sn["votes"] = fresh_votes
+                        sn["actions"] = (sn.get("reactions", 0) + sn.get("comments", 0)
+                                          + sn.get("forwards", 0) + fresh_votes)
+                        refreshed += 1
+                except Exception as e:
+                    log.warning(f"  [{channel_username}] не удалось досчитать голоса опроса {mid}: {e}")
+            if refreshed:
+                log.info(f"  [{channel_username}] голоса опросов пересчитаны свежим запросом: {refreshed}/{len(poll_ids)}")
+        except Exception as e:
+            log.warning(f"  [{channel_username}] не удалось получить сущность канала для пересчёта опросов: {e}")
+
     # Если subscribers не вернулся из исторического — берём из реестра
     if not subscribers:
         from registry_manager import load_registry
@@ -282,6 +318,8 @@ def _write_post_row(ws, r: int, p: dict, subscribers: int, bg: str):
         cell.alignment = _align(h="left" if i <= 4 else "center")
         if key == "_note":
             cell.value = note
+        elif key == "date":
+            cell.value = _fmt_date_short(p.get("date", ""))
         elif key in SNAP:
             fv(cell, sn.get(key), pct=is_pct, flt=is_flt)
         elif key in p:
@@ -644,7 +682,7 @@ def build_agg_multichannel(ws, channels_data: list,
                 dp   = by_date.get(ds, [])
                 is_we= dow >= 5
                 bg   = C["red"] if is_we else (C["white"] if idx%2==0 else C["gray"])
-                _agg_bucket_row(ws, cur, d.strftime("%d.%m.%Y"),
+                _agg_bucket_row(ws, cur, d.strftime("%d.%m.%y"),
                                 DAYS_RU[dow], dp, subs, bg, "day")
                 cur += 1; d += timedelta(days=1); idx += 1
         else:
@@ -658,7 +696,7 @@ def build_agg_multichannel(ws, channels_data: list,
                 while d <= wend:
                     wp.extend(by_date.get(d.strftime("%Y-%m-%d"), []))
                     d += timedelta(days=1)
-                label = f"{week_start.strftime('%d.%m')} – {wend.strftime('%d.%m.%Y')}"
+                label = f"{week_start.strftime('%d.%m')} – {wend.strftime('%d.%m.%y')}"
                 bg    = C["white"] if idx%2==0 else C["gray"]
                 _agg_bucket_row(ws, cur, label, "", wp, subs, bg, "week")
                 cur += 1; week_start += timedelta(days=7); idx += 1
