@@ -546,15 +546,15 @@ function renderPaidSlide(title, color, paid_ch) {{
         {{ label:"ПРИТОК",       value: total_inflow  ? total_inflow.toLocaleString("ru")      : "—" }},
         {{ label:"СРЕДНИЙ CPF",  value: avg_cpf ? avg_cpf+" ₽" : "—" }},
     ];
-    const kpiY = 1.6, kpiH = 1.0, kpiGap = 0.15;
+    const kpiY = 1.55, kpiH = 0.85, kpiGap = 0.15;
     const kpiW = (bodyW - kpiGap*(kpis.length-1)) / kpis.length;
     kpis.forEach((k, i) => {{
         paidKpiCard(s, bodyX + i*(kpiW+kpiGap), kpiY, kpiW, kpiH, k.label, k.value, color);
     }});
 
     // ── Графики: одна строка, одинаковый размер, выровнены между собой ──
-    const chartsY = kpiY + kpiH + 0.4;
-    const chartsH = 2.3;
+    const chartsY = kpiY + kpiH + 0.22;
+    const chartsH = 1.95;
     const chartGap = 0.3;
     const chartW = (bodyW - chartGap) / 2;
     const hasCharts = paid_ch.length > 1;
@@ -567,8 +567,18 @@ function renderPaidSlide(title, color, paid_ch) {{
         hBarChart(s, bodyX+chartW+chartGap, chartsY, chartW, chartsH, plat_names, cpf_vals, color, "CPF по размещениям, ₽");
     }}
 
-    // ── Таблица: под графиками, во всю ширину, шапка — в цвете канала ──
-    const tableY = hasCharts ? (chartsY + chartsH + 0.3) : chartsY;
+    // ── Таблица: под графиками, во всю ширину, шапка — в цвете канала.
+    // Высота строк ПОДСТРАИВАЕТСЯ под количество размещений — так
+    // таблица не может вылезти за пределы слайда независимо от того,
+    // сколько строк (4 или 14): чем их больше, тем компактнее строки
+    // (в разумных пределах — шрифт уменьшается лишь слегка).
+    const tableY   = hasCharts ? (chartsY + chartsH + 0.18) : chartsY;
+    const headerH  = 0.28;
+    const tableBottomLimit = FOOTER_Y - 0.08;   // небольшой запас перед подвалом
+    const availForRows = tableBottomLimit - tableY - headerH;
+    const rowH = Math.max(0.16, Math.min(0.27, availForRows / Math.max(paid_ch.length, 1)));
+    const rowFontSize = rowH >= 0.24 ? 8.5 : (rowH >= 0.20 ? 7.5 : 6.5);
+
     const cols       = ["Площадка","Дата","Стоимость","Охват","Приток","CPV","CPF"];
     const colRatios  = [3.5, 1.3, 1.5, 1.2, 1.2, 1.2, 1.2];
     const ratioSum   = colRatios.reduce((a,b) => a+b, 0);
@@ -576,13 +586,13 @@ function renderPaidSlide(title, color, paid_ch) {{
 
     let tx = bodyX;
     cols.forEach((c, i) => {{
-        s.addShape(pres.shapes.RECTANGLE, {{ x:tx, y:tableY, w:colW2[i], h:0.32, fill:{{ color }} }});
-        s.addText(c, {{ x:tx, y:tableY, w:colW2[i], h:0.32, align:"center", valign:"middle", fontSize:9, bold:true, color:WHITE }});
+        s.addShape(pres.shapes.RECTANGLE, {{ x:tx, y:tableY, w:colW2[i], h:headerH, fill:{{ color }} }});
+        s.addText(c, {{ x:tx, y:tableY, w:colW2[i], h:headerH, align:"center", valign:"middle", fontSize:9, bold:true, color:WHITE }});
         tx += colW2[i];
     }});
     paid_ch.forEach((p, ri) => {{
         let tx2 = bodyX;
-        const row_y = tableY + 0.32 + ri*0.27;
+        const row_y = tableY + headerH + ri*rowH;
         const bg2   = ri%2 === 0 ? "FFFFFF" : "F6F7FA";
         const vals2 = [
             p.platform,
@@ -594,8 +604,8 @@ function renderPaidSlide(title, color, paid_ch) {{
             p.cpf    ? p.cpf+" ₽"  : "—",
         ];
         vals2.forEach((v, i) => {{
-            s.addShape(pres.shapes.RECTANGLE, {{ x:tx2, y:row_y, w:colW2[i], h:0.27, fill:{{ color:bg2 }} }});
-            s.addText(String(v), {{ x:tx2, y:row_y, w:colW2[i], h:0.27, align: i===0?"left":"center", valign:"middle", fontSize:8.5, color:"444444", margin:3 }});
+            s.addShape(pres.shapes.RECTANGLE, {{ x:tx2, y:row_y, w:colW2[i], h:rowH, fill:{{ color:bg2 }} }});
+            s.addText(String(v), {{ x:tx2, y:row_y, w:colW2[i], h:rowH, align: i===0?"left":"center", valign:"middle", fontSize:rowFontSize, color:"444444", margin:3 }});
             tx2 += colW2[i];
         }});
     }});
