@@ -503,13 +503,15 @@ function paidKpiCard(slide, x, y, w, h, label, value, color) {{
 // есть — если нет, обложка для них просто не вызывается).
 function renderCoverSlide(title, color, subtitle) {{
     const s = pres.addSlide();
+    // Акцентная полоса слева, в цвете канала — как на остальных слайдах.
+    s.addShape(pres.shapes.RECTANGLE, {{ x:0, y:0, w:0.18, h:SLIDE_H, fill:{{ color }} }});
     s.addText(title, {{
-        x:0.6, y:SLIDE_H/2 - 0.7, w:SLIDE_W-1.2, h:1.1,
-        fontSize:40, bold:true, color:"#"+color, align:"center", valign:"middle",
+        x:0.6, y:SLIDE_H/2 - 0.85, w:SLIDE_W-1.2, h:1.3,
+        fontSize:72, bold:true, color:"#"+color, align:"center", valign:"middle",
     }});
     s.addText(subtitle, {{
-        x:0.6, y:SLIDE_H/2 + 0.45, w:SLIDE_W-1.2, h:0.5,
-        fontSize:16, color:GRAY, align:"center",
+        x:0.6, y:SLIDE_H/2 + 0.55, w:SLIDE_W-1.2, h:0.55,
+        fontSize:28, color:GRAY, align:"center",
     }});
     s.addText(String(slideNum).padStart(2,"0"), {{ x:SLIDE_W-0.8, y:SLIDE_H-0.4, w:0.5, h:0.3, fontSize:10, color:GRAY, align:"right" }});
     slideNum++;

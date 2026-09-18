@@ -314,10 +314,15 @@ def _fetch_google_rows(month_label: str = None) -> list | None:
 
 def get_paid_placements(channel: str, date_from, date_to) -> list[dict]:
     """
-    Возвращает платные размещения для канала за период — объединяя
-    Google Sheets (если настроен) И локальный файл, заполненный вручную
-    через import_paid_placements.py. Источники дополняют друг друга, не
-    заменяют один другой.
+    Возвращает платные размещения для канала за период.
+
+    Приоритет - Google Sheets: если лист нужного месяца ("Август 2026")
+    существует, используются ТОЛЬКО данные из него. Локальный файл
+    (заполняется вручную через import_paid_placements.py) - запасной
+    вариант, применяется ТОЛЬКО когда листа в Google Sheets ещё нет
+    вообще (или Google Sheets не настроен) - не как дополнение к нему.
+    Так исключён сам класс бага "одно и то же размещение в обоих
+    источниках считается дважды" - источник всегда ровно один.
     """
     from config import DASHBOARD_CHANNELS, MONTHS_RU
     channels_config = DASHBOARD_CHANNELS
@@ -327,31 +332,28 @@ def get_paid_placements(channel: str, date_from, date_to) -> list[dict]:
     year_hint = date_from.year
     month_label = f"{MONTHS_RU.get(date_from.month,'')} {date_from.year}"
 
-    result = []
-
-    # 1. Google Sheets — лист с именем нужного месяца ("Август 2026" и т.п.)
     rows = _fetch_google_rows(month_label)
     if rows and len(rows) >= 2:
         by_key, _ = _parse_rows(rows[1:], channels_config, df_str, dt_str, year_hint)
-        result.extend(by_key.get(channel, []))
+        return by_key.get(channel, [])
 
-    # 2. Локальный файл (ручной импорт)
+    # Листа нет (или Google Sheets не настроен) - запасной вариант
     local = load_local_placements()
-    for p in local.get(channel, []):
-        if df_str <= p.get("date", "") <= dt_str:
-            result.append(p)
-
-    return result
+    return [p for p in local.get(channel, []) if df_str <= p.get("date", "") <= dt_str]
 
 
 def get_extra_paid_groups(date_from, date_to) -> dict:
     """
-    Возвращает платные размещения из "дополнительных" разделов — тех,
+    Возвращает платные размещения из "дополнительных" разделов - тех,
     чьё название не совпало ни с одним каналом из DASHBOARD_CHANNELS
     (например "HRTech"). Для каждого такого раздела дашборд строит
     отдельный слайд в самом конце презентации (см. renderPaidSlide в
-    dashboard_report.py), с названием раздела в заголовке слайда — по
+    dashboard_report.py), с названием раздела в заголовке слайда - по
     аналогии со слайдом платных размещений канала.
+
+    Тот же приоритет, что и в get_paid_placements: если лист месяца в
+    Google Sheets есть - источник только он; локальный файл смотрим
+    только когда листа нет вообще.
 
     Возвращает {название_раздела: [placement, ...]}.
     """
@@ -364,25 +366,24 @@ def get_extra_paid_groups(date_from, date_to) -> dict:
     year_hint = date_from.year
     month_label = f"{MONTHS_RU.get(date_from.month,'')} {date_from.year}"
 
-    result: dict = {}
-
-    # 1. Google Sheets — лист с именем нужного месяца
     rows = _fetch_google_rows(month_label)
     if rows and len(rows) >= 2:
         by_key, extra_headers = _parse_rows(rows[1:], channels_config, df_str, dt_str, year_hint)
+        result = {}
         for name in extra_headers:
             if by_key.get(name):
-                result.setdefault(name, []).extend(by_key[name])
+                result[name] = by_key[name]
+        return result
 
-    # 2. Локальный файл — любой ключ, который не является известным каналом
+    # Листа нет - запасной вариант из локального файла
     local = load_local_placements()
+    result = {}
     for key, placements in local.items():
         if key in known_channels:
             continue
         filtered = [p for p in placements if df_str <= p.get("date", "") <= dt_str]
         if filtered:
-            result.setdefault(key, []).extend(filtered)
-
+            result[key] = filtered
     return result
 
 
