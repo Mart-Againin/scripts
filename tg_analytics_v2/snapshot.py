@@ -275,9 +275,20 @@ async def process_channel(client, channel_id: str):
         else:
             raw_msgs.append(msg)
 
-    # Из каждого альбома берём первое фото (min msg_id)
+    # Из каждого альбома берём первое фото (min msg_id) — у него
+    # привязаны реакции/комментарии. Но подпись (caption) альбома не
+    # всегда лежит именно на этом сообщении — Telegram может прикрепить
+    # её к любому элементу группы. Если у выбранного представителя текст
+    # пуст, а у другого сообщения группы он есть — подставляем текст
+    # оттуда (тот же фикс, что в historical.py — здесь отдельная копия
+    # той же логики, была пропущена при первом исправлении).
     for group_msgs in grouped_map_snap.values():
-        raw_msgs.append(min(group_msgs, key=lambda m: m.id))
+        first = min(group_msgs, key=lambda m: m.id)
+        if not (first.message or "").strip():
+            text_source = next((m for m in group_msgs if (m.message or "").strip()), None)
+            if text_source is not None:
+                first.message = text_source.message
+        raw_msgs.append(first)
 
     for msg in raw_msgs:
         msg_id = str(msg.id)

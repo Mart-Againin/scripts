@@ -22,17 +22,25 @@ def make_post_preview(post: dict, n_words: int = 9) -> str:
       5. Берём первые n_words слов (если слов меньше — весь текст).
       6. Если текста нет вообще — "Без текста".
     """
+    # ВАЖНО: возвращаем "" (не "Без текста") когда текста нет — эта
+    # строка идёт в JS как post_preview, и JS делает
+    # `post_preview || text_short || "Без текста"`. Если здесь вернуть
+    # готовую строку "Без текста", она перекроет text_short НАВСЕГДА,
+    # даже если text_short у того же поста заполнен правильно из другого
+    # источника — сам JS-fallback "Без текста" достаточен, дублировать
+    # его здесь как результат функции нельзя (реальный баг, из-за
+    # которого на дашборде показывалось "Без текста" при наличии текста).
     text = post.get("message", "") or post.get("text", "") or ""
     if not text.strip():
-        return "Без текста"
+        return ""
     text = _re.sub(r'https?://\S+', '', text)
     text = _re.sub(r'[\r\n\t]+', ' ', text)
     text = _re.sub(r' {2,}', ' ', text).strip()
     if not text:
-        return "Без текста"
+        return ""
     words = text.split()
     preview = " ".join(words[:n_words])
-    return preview if preview else "Без текста"
+    return preview
 
 def _safe_div(a, b, pct=False, decimals=2):
     if not b:

@@ -305,6 +305,25 @@ def _channel_divider(ws, row: int, ch_id: str, subs: int, is_hist: bool = False)
     ws[f"A{row}"].alignment = _align(h="left")
     ws.row_dimensions[row].height = 22
 
+def _estimate_row_height(p: dict, base: int = 18, line_h: int = 13) -> int:
+    """
+    Высота строки под перенесённый (wrap_text=True) текст — openpyxl не
+    умеет считать это автоматически (нет рендеринга шрифта), поэтому
+    прикидываем по длине текста и ширине колонки. Смотрим на "Тема" и
+    "Ссылка" — единственные колонки POST_COLS, где текст реально может
+    быть длиннее ширины ячейки; берём максимум нужных строк между ними.
+    """
+    candidates = [("text_short", 35), ("url", 28)]
+    max_lines = 1
+    for key, col_width in candidates:
+        text = str(p.get(key, "") or "")
+        if not text:
+            continue
+        lines = -(-len(text) // col_width)  # ceil без импорта math
+        max_lines = max(max_lines, lines)
+    return max(base, max_lines * line_h + 5)
+
+
 def _write_post_row(ws, r: int, p: dict, subscribers: int, bg: str):
     sn      = p.get("snapshot", {}) or {}
     m       = calc(sn, subscribers)
@@ -400,7 +419,7 @@ def build_multichannel_posts_sheet(ws, channels_data: list,
 
         for idx, p in enumerate(posts):
             _write_post_row(ws, cur, p, subs, C["white"] if idx%2==0 else C["gray"])
-            ws.row_dimensions[cur].height = 18
+            ws.row_dimensions[cur].height = _estimate_row_height(p)
             cur += 1
 
         best, totals, avgs = _channel_totals_row(ws, cur, posts, subs, ch_id)

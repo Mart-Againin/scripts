@@ -129,8 +129,16 @@ async def fetch_and_cache_month(client, channel_username: str,
 
     Возвращает (posts, subscribers).
     """
+    # Текущий, ещё идущий месяц НИКОГДА не берём из кэша — он по
+    # определению неполный в любой момент до конца месяца, и ранний
+    # пустой/неполный снимок иначе застревает в кэше навсегда (реальный
+    # случай: кэш собран 2 сентября с posts=[], и до конца месяца отчёты
+    # читали именно этот пустой снимок). Прошлые, уже закрытые месяцы
+    # кэшируются как и раньше — они больше не меняются.
+    is_current_month = (ym == date.today().strftime("%Y-%m"))
+
     # Проверяем кэш
-    if not force:
+    if not force and not is_current_month:
         cached = load_historical_month(channel_username, ym)
         if cached is not None:
             # Читаем subscribers из файла
@@ -193,10 +201,20 @@ async def fetch_and_cache_month(client, channel_username: str,
         else:
             raw_posts.append(msg)
 
-    # Из каждого альбома берём сообщение с наименьшим msg_id
-    # (первое фото альбома — у него привязаны реакции и комментарии)
+    # Из каждого альбома берём сообщение с наименьшим msg_id — у него
+    # привязаны реакции и комментарии, это должно оставаться источником
+    # для них. НО подпись (caption) альбома не всегда лежит именно на
+    # этом сообщении — Telegram может прикрепить её к любому элементу
+    # группы. Если у "представителя" текст пуст, а у другого сообщения
+    # той же группы он есть — подставляем текст оттуда, не теряя его
+    # молча (реакции/комментарии при этом по-прежнему берутся с minimal
+    # msg_id, тут меняется только то, что идёт в поле message).
     for group_msgs in grouped_map.values():
         first = min(group_msgs, key=lambda m: m.id)
+        if not (first.message or "").strip():
+            text_source = next((m for m in group_msgs if (m.message or "").strip()), None)
+            if text_source is not None:
+                first.message = text_source.message
         raw_posts.append(first)
 
     posts = []

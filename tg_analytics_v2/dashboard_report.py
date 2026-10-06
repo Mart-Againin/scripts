@@ -175,7 +175,11 @@ def _build_pptx(output_path: Path, all_data: dict, ym: str,
     import subprocess
     import tempfile
 
-    NODE_PATH = r"C:\Users\admin\AppData\Roaming\npm\node_modules"
+    # Где лежит pptxgenjs (глобальные модули npm: `npm root -g`). Задаётся в .env как
+    # NODE_MODULES_PATH; без него — прежний путь по умолчанию, поэтому на уже
+    # настроенной машине поведение не меняется.
+    NODE_PATH = os.getenv("NODE_MODULES_PATH",
+                          r"C:\Users\admin\AppData\Roaming\npm\node_modules")
     
     script = _make_pptx_script(all_data, str(output_path), ym,
                                 period_label, history_range)
@@ -189,7 +193,7 @@ def _build_pptx(output_path: Path, all_data: dict, ym: str,
         result = subprocess.run(
             ["node", script_path],
             capture_output=True, text=True, timeout=120,
-            env={**os.environ, "NODE_PATH": NODE_PATH}  # <-- ДОБАВИТЬ
+            env={**os.environ, "NODE_PATH": NODE_PATH}
         )
         if result.returncode != 0:
             log.error(f"pptxgenjs error: {result.stderr}")
