@@ -39,6 +39,7 @@ import historical as hist
 import stories as stories_mod
 import dashboard_report as dash_rep
 import import_paid_placements as paid_import
+import restart_helper as rh
 
 WEEKLY_DAY  = 0   # понедельник
 MONTHLY_DAY = 3   # 3-е число
@@ -55,6 +56,7 @@ log = logging.getLogger(__name__)
 
 ALLOWED_SENDERS = set(RECIPIENT_IDS + DEBUG_IDS + MODERATOR_IDS)
 _dialog_state: dict = {}
+_restart_tasks: set = set()   # ссылки на задачи перезапуска (иначе их может собрать GC)
 
 
 # ── Авторизация ───────────────────────────────────────────────────────────
@@ -172,6 +174,11 @@ _last_monthly  = None
 
 async def tick(client: TelegramClient):
     global _last_snapshot, _last_daily, _last_weekly, _last_monthly
+
+    # Идёт перезапуск — не переподключаемся и ничего не собираем, иначе
+    # старый процесс оживёт рядом с новым на одной сессии Telegram.
+    if rh.RESTARTING:
+        return
 
     # Переподключение если соединение потеряно
     if not client.is_connected():
@@ -307,22 +314,35 @@ def register_command_handler(client: TelegramClient):
     @client.on(events.NewMessage(pattern=r"^/restart$", incoming=True))
     async def handle_restart(event):
         """
-        /restart — перезапускает сам процесс main.py (без ручного
-        Ctrl+C и повторного запуска из консоли). Заменяет текущий
-        процесс новым запуском того же файла с теми же аргументами
-        (os.execv) — на диске подхватятся ЛЮБЫЕ изменения в .py-файлах,
-        как будто вы сами остановили и заново запустили скрипт.
+        /restart — запускает НОВЫЙ процесс и завершает старый (см.
+        restart_helper.py). Подтверждение "✅" присылает именно новый
+        процесс; если оно не пришло — перезапуск не состоялся, причина
+        в логе (строки [RESTART]) и в окне нового процесса.
         """
         sender_id = event.sender_id
         if sender_id not in ALLOWED_SENDERS:
             return
-        log.info(f"Команда /restart от {sender_id} — перезапускаю процесс")
-        await event.reply("🔄 Перезапускаюсь... (обычно занимает несколько секунд)")
-        try:
-            await client.disconnect()
-        except Exception as e:
-            log.warning(f"Ошибка при отключении перед перезапуском: {e}")
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+        if rh.RESTARTING:
+            await event.reply("⏳ Перезапуск уже выполняется, подождите.")
+            return
+        old_pid = os.getpid()
+        log.info(f"[RESTART] Команда /restart от {sender_id} (старый PID {old_pid})")
+        await event.reply(
+            f"🔄 Перезапуск запущен (старый PID {old_pid}). Если всё пройдёт "
+            f"успешно, новый процесс пришлёт «✅ Перезапуск выполнен успешно» "
+            f"в течение ~минуты.")
+
+        chat_id = event.chat_id
+
+        async def _send(text):
+            await client.send_message(chat_id, text)
+
+        # ОТДЕЛЬНАЯ задача, не внутри обработчика: client.disconnect()
+        # отменяет задачи обработчиков, и код после него в самом
+        # обработчике не выполнился бы никогда.
+        task = asyncio.create_task(rh.perform_restart(chat_id, _send, client.disconnect))
+        _restart_tasks.add(task)
+        task.add_done_callback(_restart_tasks.discard)
 
     @client.on(events.NewMessage(pattern=r"^/inspect ", incoming=True))
     async def handle_inspect(event):
@@ -871,6 +891,17 @@ def register_command_handler(client: TelegramClient):
 
 # ── Главный цикл ──────────────────────────────────────────────────────────
 
+async def _send_with_dialog_refresh(client: TelegramClient, chat_id, text: str):
+    """Отправка подтверждения после перезапуска. Новый процесс мог не
+    загрузить собеседника в кэш — тогда один раз подтягиваем диалоги."""
+    try:
+        await client.send_message(chat_id, text)
+    except Exception as first_err:
+        log.warning(f"[RESTART] Первая отправка не удалась ({first_err}), обновляю диалоги")
+        await client.get_dialogs(limit=100)
+        await client.send_message(chat_id, text)
+
+
 async def main():
     kwargs = get_telethon_kwargs()
 
@@ -891,12 +922,22 @@ async def main():
     print("  Для остановки нажмите Ctrl+C")
     print()
 
+    rh.log_start_banner()
+    # Запуск после /restart: ждём, пока старый процесс реально исчезнет
+    # (до подключения к Telegram — иначе два процесса на одной сессии).
+    restart_marker = rh.prepare_after_restart()
+
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH, **kwargs)
     await client.connect()
 
     try:
         await authorize(client)
         register_command_handler(client)
+
+        if restart_marker:
+            async def _notify(text, _cid=restart_marker.get("chat_id")):
+                await _send_with_dialog_refresh(client, _cid, text)
+            await rh.report_restart_result(_notify, restart_marker)
 
         log.info("Планировщик и обработчик команд запущены.")
         if DEBUG_MODE:
